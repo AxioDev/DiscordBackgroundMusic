@@ -141,6 +141,7 @@ async function getJamendoAmbientTrackStream() {
     audioformat: 'mp32'
   });
   const url = `https://api.jamendo.com/v3.0/tracks/?${searchParams.toString()}`;
+  console.log('url Jamendo:', url);
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Jamendo API error ${res.status}`);
   const j = await res.json();
