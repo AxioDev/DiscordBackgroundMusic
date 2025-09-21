@@ -25,7 +25,9 @@ export JAMENDO_CLIENT_ID="<your jamendo client id>"
 node index.js
 ```
 
-Optional environment variables `GUILD_ID` and `VOICE_CHANNEL_ID` let the bot auto-join a voice channel on startup.
+Optional environment variables `GUILD_ID` and `VOICE_CHANNEL_ID` let the bot auto-join a voice channel on startup. You can also
+set `JAMENDO_MUSIC_TAG` to choose the default Jamendo style (defaults to `ambient`). The music tag can be changed at runtime in
+Discord with the `--change-music-tag <tag>` command.
 
 ## Docker
 
