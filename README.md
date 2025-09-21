@@ -7,7 +7,7 @@ This project runs a self-hosted Discord music helper that can automatically join
 - Node.js 20 or newer (a recent LTS works, even though `@discordjs/voice@0.19` currently warns about Node versions <22).
 - FFmpeg available in your PATH (installed automatically in the Docker image).
 - A Discord user token and a Jamendo API client ID exported as environment variables `BOT_TOKEN` and `JAMENDO_CLIENT_ID`.
-- One opus encoder implementation. The bot now depends on `@discordjs/opus` directly, which resolves the runtime error like `Cannot find module '@discordjs/opus'` that prevented the voice connection from starting.
+- One Opus encoder implementation. The project now ships with the pure JavaScript `opusscript` fallback so that builds succeed without compiling native modules, but you can optionally add `@discordjs/opus` for better performance when your environment supports it.
 
 ## Installation
 
