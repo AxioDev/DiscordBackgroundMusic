@@ -84,26 +84,60 @@ client.once('ready', async () => {
   }
 });
 
-// Recherche une piste "ambient" sur Jamendo (simple)
-async function getJamendoAmbientTrackUrl() {
-  const url = `https://api.jamendo.com/v3.0/tracks/?client_id=${JAMENDO_CLIENT_ID}&format=json&limit=1&order=popularity_total_desc&tags=ambient&audioformat=mp32`;
+// Recherche une piste "ambient" sur Jamendo en privilégiant celles dont le téléchargement est autorisé
+async function getJamendoAmbientTrackStream() {
+  const searchParams = new URLSearchParams({
+    client_id: JAMENDO_CLIENT_ID,
+    format: 'json',
+    limit: '20',
+    order: 'popularity_total_desc',
+    tags: 'ambient',
+    audioformat: 'mp32'
+  });
+  const url = `https://api.jamendo.com/v3.0/tracks/?${searchParams.toString()}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Jamendo API error ${res.status}`);
   const j = await res.json();
   if (!j.results || j.results.length === 0) throw new Error('Aucune piste trouvée sur Jamendo.');
-  const track = j.results[0];
-  if (!track.audio) throw new Error('Piste trouvée mais pas d\'URL audio.');
-  let audioUrl = track.audio;
-  try {
-    const parsed = new URL(audioUrl);
-    if (!parsed.searchParams.has('from')) {
-      parsed.searchParams.set('from', `app-${JAMENDO_CLIENT_ID}`);
-      audioUrl = parsed.toString();
+
+  let lastStreamError = null;
+
+  for (const track of j.results) {
+    if (!track || !track.audio) continue;
+    if (track.audiodownload_allowed === false) continue; // piste non téléchargeable => éviter les 404
+
+    let audioUrl = track.audio;
+    try {
+      const parsed = new URL(audioUrl);
+      if (!parsed.searchParams.has('from')) {
+        parsed.searchParams.set('from', `app-${JAMENDO_CLIENT_ID}`);
+        audioUrl = parsed.toString();
+      }
+    } catch (err) {
+      // on ne modifie pas si l'URL n'est pas parseable
     }
-  } catch (err) {
-    // on ne modifie pas si l'URL n'est pas parseable
+
+    try {
+      const stream = await fetchAudioStream(audioUrl, `l'audio Jamendo pour ${track.name || 'une piste'}`);
+      const licenseUrl = track.license_ccurl || track.license || null;
+      return {
+        stream,
+        info: {
+          audioUrl,
+          name: track.name || 'Piste Jamendo',
+          artist: track.artist_name || 'Artiste Jamendo',
+          licenseUrl
+        }
+      };
+    } catch (err) {
+      lastStreamError = err;
+    }
   }
-  return { audioUrl, name: track.name, artist: track.artist_name, license: track.license };
+
+  if (lastStreamError) {
+    throw new Error(`Aucune piste Jamendo lisible (${lastStreamError.message || lastStreamError})`);
+  }
+  throw new Error('Aucune piste Jamendo lisible trouvée.');
 }
 
 async function fetchAudioStream(url, label = 'source distante') {
@@ -195,11 +229,11 @@ client.on('messageCreate', async (msg) => {
         }
       } else {
         // récupérer une piste Jamendo
-        const { audioUrl, name, artist, license } = await getJamendoAmbientTrackUrl();
-        const remoteStream = await fetchAudioStream(audioUrl, 'l\'audio Jamendo');
+        const { stream: remoteStream, info: trackInfo } = await getJamendoAmbientTrackStream();
         resource = createAudioResource(remoteStream, { inputType: StreamType.Arbitrary, inlineVolume: true });
         // on peut informer l'utilisateur
-        msg.channel.send(`▶️ Lecture préparée : **${name}** — ${artist} (license: ${license})`).catch(()=>{});
+        const licensePart = trackInfo.licenseUrl ? ` (license: ${trackInfo.licenseUrl})` : '';
+        msg.channel.send(`▶️ Lecture préparée : **${trackInfo.name}** — ${trackInfo.artist}${licensePart}`).catch(()=>{});
       }
 
       if (resource.volume) resource.volume.setVolume(currentVolume);
