@@ -1,5 +1,4 @@
-// index.js — Bot officiel Discord + Jamendo ambient (Node.js)
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits } = require('discord.js-selfbot-v13');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior } = require('@discordjs/voice');
 const fetch = require('node-fetch'); // ou global fetch sur Node18+
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -9,7 +8,7 @@ if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
   process.exit(1);
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const client = new Client({  });
 
 let voiceConnection = null;
 const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
