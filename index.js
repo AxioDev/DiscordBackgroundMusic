@@ -10,6 +10,28 @@ if (typeof globalThis.File === 'undefined' && typeof bufferModule.File === 'func
   globalThis.File = bufferModule.File;
 }
 
+// discord.js-selfbot-v13 attend String.prototype.toWellFormed() (Node >=16.9).
+// Certains environnements (versions LTS plus anciennes) ne l'exposent pas : on ajoute
+// un polyfill minimal convertissant toute paire suppléante isolée en U+FFFD.
+if (typeof ''.toWellFormed !== 'function') {
+  Object.defineProperty(String.prototype, 'toWellFormed', {
+    value: function toWellFormed() {
+      let output = '';
+      for (const segment of this) {
+        const codePoint = segment.codePointAt(0);
+        if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
+          output += '\uFFFD';
+        } else {
+          output += segment;
+        }
+      }
+      return output;
+    },
+    configurable: true,
+    writable: true
+  });
+}
+
 const { Client, GatewayIntentBits } = require('discord.js-selfbot-v13');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior } = require('@discordjs/voice');
 const fetch = require('node-fetch'); // node 18+ peut utiliser global fetch
@@ -71,7 +93,33 @@ async function getJamendoAmbientTrackUrl() {
   if (!j.results || j.results.length === 0) throw new Error('Aucune piste trouvée sur Jamendo.');
   const track = j.results[0];
   if (!track.audio) throw new Error('Piste trouvée mais pas d\'URL audio.');
-  return { audioUrl: track.audio, name: track.name, artist: track.artist_name, license: track.license };
+  let audioUrl = track.audio;
+  try {
+    const parsed = new URL(audioUrl);
+    if (!parsed.searchParams.has('from')) {
+      parsed.searchParams.set('from', `app-${JAMENDO_CLIENT_ID}`);
+      audioUrl = parsed.toString();
+    }
+  } catch (err) {
+    // on ne modifie pas si l'URL n'est pas parseable
+  }
+  return { audioUrl, name: track.name, artist: track.artist_name, license: track.license };
+}
+
+async function fetchAudioStream(url, label = 'source distante') {
+  const response = await fetch(url, {
+    redirect: 'follow',
+    headers: {
+      'User-Agent': 'DiscordBackgroundMusicBot/1.0 (+https://github.com/DiscordBackgroundMusic/DiscordBackgroundMusic)',
+      Accept: 'audio/*;q=0.9,*/*;q=0.5'
+    }
+  });
+  if (!response.ok || !response.body) {
+    const statusText = (response.statusText || '').trim();
+    const statusInfo = statusText ? `${response.status} ${statusText}` : String(response.status);
+    throw new Error(`Impossible de récupérer ${label} (${statusInfo})`);
+  }
+  return response.body;
 }
 
 client.on('messageCreate', async (msg) => {
@@ -139,15 +187,17 @@ client.on('messageCreate', async (msg) => {
       let resource;
       if (source) {
         // si c'est un URL, stream direct via fetch/ytdl selon type (ici on traite comme URL mp3)
-        const remote = await fetch(source);
-        if (!remote.ok) return msg.channel.send('Impossible de récupérer la source fournie.');
-        resource = createAudioResource(remote.body, { inputType: StreamType.Arbitrary, inlineVolume: true });
+        try {
+          const remoteStream = await fetchAudioStream(source, 'la source fournie');
+          resource = createAudioResource(remoteStream, { inputType: StreamType.Arbitrary, inlineVolume: true });
+        } catch (err) {
+          return msg.channel.send(`Impossible de récupérer la source fournie (${err.message}).`);
+        }
       } else {
         // récupérer une piste Jamendo
         const { audioUrl, name, artist, license } = await getJamendoAmbientTrackUrl();
-        const remote = await fetch(audioUrl);
-        if (!remote.ok) throw new Error('Erreur lors du téléchargement audio depuis Jamendo.');
-        resource = createAudioResource(remote.body, { inputType: StreamType.Arbitrary, inlineVolume: true });
+        const remoteStream = await fetchAudioStream(audioUrl, 'l\'audio Jamendo');
+        resource = createAudioResource(remoteStream, { inputType: StreamType.Arbitrary, inlineVolume: true });
         // on peut informer l'utilisateur
         msg.channel.send(`▶️ Lecture préparée : **${name}** — ${artist} (license: ${license})`).catch(()=>{});
       }
