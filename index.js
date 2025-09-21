@@ -67,8 +67,24 @@ if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
   process.exit(1);
 }
 
+const ALLOWED_USER_ID = '216189520872210444';
+const ALLOWED_ROLE_NAMES = ['Radio', 'Modo', 'Medium'];
+
+function isAuthorizedUser(message) {
+  if (message.author.id === ALLOWED_USER_ID) {
+    return true;
+  }
+
+  const memberRoles = message.member?.roles?.cache;
+  if (!memberRoles || typeof memberRoles.some !== 'function') {
+    return false;
+  }
+
+  return memberRoles.some((role) => ALLOWED_ROLE_NAMES.includes(role.name));
+}
+
 const client = new Client({
-    
+
 });
 
 let voiceConnection = null;
@@ -181,6 +197,10 @@ async function fetchAudioStream(url, label = 'source distante') {
 client.on('messageCreate', async (msg) => {
   if (msg.author.bot) return;
   if (!msg.content.startsWith('--')) return;
+
+  if (!isAuthorizedUser(msg)) {
+    return msg.channel.send('❌ Tu n\'es pas autorisé à utiliser ce bot.');
+  }
 
   const parts = msg.content.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase();
