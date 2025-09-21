@@ -71,10 +71,22 @@ const JAMENDO_CLIENT_ID = process.env.JAMENDO_CLIENT_ID;
 const AUTO_GUILD_ID = process.env.GUILD_ID || null;
 const AUTO_VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || null;
 
+function sanitizeMusicTag(rawTag) {
+  if (typeof rawTag !== 'string') return null;
+  const trimmed = rawTag.trim();
+  if (!trimmed) return null;
+  return trimmed.toLowerCase().replace(/\s+/g, '-');
+}
+
+const DEFAULT_JAMENDO_TAG = sanitizeMusicTag(process.env.JAMENDO_MUSIC_TAG) || 'ambient';
+let currentJamendoTag = DEFAULT_JAMENDO_TAG;
+
 if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
   console.error('Définis BOT_TOKEN et JAMENDO_CLIENT_ID dans les variables d\'env.');
   process.exit(1);
 }
+
+console.log(`Tag Jamendo initial: ${currentJamendoTag}`);
 
 const ALLOWED_USER_ID = '216189520872210444';
 const ALLOWED_ROLE_NAMES = ['Radio', 'Modo', 'Medium'];
@@ -109,19 +121,37 @@ let playbackRequestToken = 0;
 let skipInProgressCount = 0;
 let lastVoiceChannelId = null;
 
-const jamendoRecentTrackIds = [];
+const jamendoRecentTrackIdsByTag = new Map();
 const JAMENDO_RECENT_TRACK_HISTORY = 5;
 
-function rememberJamendoTrack(trackId) {
-  if (!trackId) return;
-  const normalized = String(trackId);
-  const existingIndex = jamendoRecentTrackIds.indexOf(normalized);
-  if (existingIndex !== -1) {
-    jamendoRecentTrackIds.splice(existingIndex, 1);
+function getJamendoHistoryBucket(tag) {
+  const key = tag || '';
+  let bucket = jamendoRecentTrackIdsByTag.get(key);
+  if (!bucket) {
+    bucket = [];
+    jamendoRecentTrackIdsByTag.set(key, bucket);
   }
-  jamendoRecentTrackIds.push(normalized);
-  while (jamendoRecentTrackIds.length > JAMENDO_RECENT_TRACK_HISTORY) {
-    jamendoRecentTrackIds.shift();
+  return bucket;
+}
+
+function getRecentJamendoTrackIds(tag) {
+  const key = tag || '';
+  const bucket = jamendoRecentTrackIdsByTag.get(key);
+  return bucket ? bucket.slice() : [];
+}
+
+function rememberJamendoTrack(tag, trackId) {
+  if (!trackId) return;
+  const normalized = getNormalizedJamendoId(trackId);
+  if (!normalized) return;
+  const bucket = getJamendoHistoryBucket(tag);
+  const existingIndex = bucket.indexOf(normalized);
+  if (existingIndex !== -1) {
+    bucket.splice(existingIndex, 1);
+  }
+  bucket.push(normalized);
+  while (bucket.length > JAMENDO_RECENT_TRACK_HISTORY) {
+    bucket.shift();
   }
 }
 
@@ -168,18 +198,19 @@ client.once('ready', async () => {
   }
 });
 
-// Recherche une piste "ambient" sur Jamendo en privilégiant celles dont le téléchargement est autorisé
-async function getJamendoAmbientTrackStream() {
+// Recherche une piste sur Jamendo en fonction du tag actuel en privilégiant celles dont le téléchargement est autorisé
+async function getJamendoTrackStream(tag = currentJamendoTag) {
+  const effectiveTag = sanitizeMusicTag(tag) || DEFAULT_JAMENDO_TAG;
   const searchParams = new URLSearchParams({
     client_id: JAMENDO_CLIENT_ID,
     format: 'json',
     limit: '20',
     order: 'popularity_total_desc',
-    tags: 'ambient',
+    tags: effectiveTag,
     audioformat: 'mp32'
   });
   const url = `https://api.jamendo.com/v3.0/tracks/?${searchParams.toString()}`;
-  console.log('url Jamendo:', url);
+  console.log(`url Jamendo (${effectiveTag}):`, url);
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Jamendo API error ${res.status}`);
   const j = await res.json();
@@ -199,8 +230,8 @@ async function getJamendoAmbientTrackStream() {
     throw new Error('Aucune piste Jamendo lisible trouvée.');
   }
 
-  const previousJamendoId = getNormalizedJamendoId(lastTrackInfo?.jamendoId);
-  const recentIds = new Set(jamendoRecentTrackIds);
+  const previousJamendoId = lastTrackInfo?.tag === effectiveTag ? getNormalizedJamendoId(lastTrackInfo?.jamendoId) : null;
+  const recentIds = new Set(getRecentJamendoTrackIds(effectiveTag));
   const preferred = [];
   const fallback = [];
 
@@ -238,7 +269,8 @@ async function getJamendoAmbientTrackStream() {
           name: track.name || 'Piste Jamendo',
           artist: track.artist_name || 'Artiste Jamendo',
           licenseUrl,
-          jamendoId
+          jamendoId,
+          tag: effectiveTag
         }
       };
     } catch (err) {
@@ -409,10 +441,11 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
         name: 'Source fournie',
         artist: customUrl,
         audioUrl: customUrl,
-        licenseUrl: null
+        licenseUrl: null,
+        tag: null
       };
     } else {
-      const jamendoData = await getJamendoAmbientTrackStream();
+      const jamendoData = await getJamendoTrackStream();
       remoteStream = jamendoData.stream;
       trackInfo = jamendoData.info;
     }
@@ -447,7 +480,7 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
     currentResource = resource;
     lastTrackInfo = trackInfo;
     if (trackInfo && trackInfo.jamendoId) {
-      rememberJamendoTrack(trackInfo.jamendoId);
+      rememberJamendoTrack(trackInfo.tag, trackInfo.jamendoId);
     }
     player.play(resource);
     connection.subscribe(player);
@@ -674,6 +707,23 @@ client.on('messageCreate', async (msg) => {
       currentResource = null;
       lastTrackInfo = null;
       return msg.channel.send('⏹ Musique arrêtée et déconnectée.');
+    }
+
+    else if (cmd === '--change-music-tag') {
+      const requestedTagRaw = parts.slice(1).join(' ');
+      if (!requestedTagRaw) {
+        return msg.channel.send(`🎶 Tag Jamendo actuel : **${currentJamendoTag}**. Usage: --change-music-tag <tag>`);
+      }
+      const sanitizedTag = sanitizeMusicTag(requestedTagRaw);
+      if (!sanitizedTag) {
+        return msg.channel.send('❌ Tag invalide. Exemple: --change-music-tag jazz');
+      }
+      if (sanitizedTag === currentJamendoTag) {
+        return msg.channel.send(`ℹ️ Le style est déjà défini sur **${currentJamendoTag}**.`);
+      }
+      currentJamendoTag = sanitizedTag;
+      lastTrackInfo = null;
+      return msg.channel.send(`🎼 Style Jamendo défini sur **${currentJamendoTag}**. Utilise --skip-music pour passer directement sur ce style.`);
     }
 
     else if (cmd === '--change-volume') {
