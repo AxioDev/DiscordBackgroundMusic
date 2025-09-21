@@ -3,6 +3,13 @@
 // Variables requises : BOT_TOKEN, JAMENDO_CLIENT_ID
 // Optionnelles : GUILD_ID, VOICE_CHANNEL_ID (pour auto-join au démarrage)
 
+// Certains environnements Node (ex: 18.x) n'exposent pas File en global, ce qui fait
+// échouer undici utilisé par discord.js. On le mappe depuis node:buffer si absent.
+const bufferModule = require('node:buffer');
+if (typeof globalThis.File === 'undefined' && typeof bufferModule.File === 'function') {
+  globalThis.File = bufferModule.File;
+}
+
 const { Client, GatewayIntentBits } = require('discord.js-selfbot-v13');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior } = require('@discordjs/voice');
 const fetch = require('node-fetch'); // node 18+ peut utiliser global fetch
