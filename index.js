@@ -54,13 +54,26 @@ if (typeof ''.toWellFormed !== 'function') {
   });
 }
 
+const http = require('node:http');
+const { URL } = require('node:url');
 const { Client, GatewayIntentBits } = require('discord.js-selfbot-v13');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior } = require('@discordjs/voice');
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  StreamType,
+  NoSubscriberBehavior
+} = require('@discordjs/voice');
 const fetch = require('node-fetch'); // node 18+ peut utiliser global fetch
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const JAMENDO_CLIENT_ID = process.env.JAMENDO_CLIENT_ID;
 const AUTO_GUILD_ID = process.env.GUILD_ID || null;
 const AUTO_VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || null;
+const VOICE_API_PORT = Number.parseInt(
+  process.env.VOICE_API_PORT || process.env.API_PORT || process.env.PORT || '3000',
+  10
+);
+const VOICE_API_HOST = process.env.VOICE_API_HOST || '0.0.0.0';
 
 if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
   console.error('Définis BOT_TOKEN et JAMENDO_CLIENT_ID dans les variables d\'env.');
@@ -92,8 +105,303 @@ const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavi
 let currentResource = null;
 let currentVolume = 0.05; // 5% par défaut
 
+const trackedVoiceUsers = new Map();
+const trackedVoiceContext = {
+  guildId: AUTO_GUILD_ID,
+  channelId: AUTO_VOICE_CHANNEL_ID,
+  guildName: null,
+  channelName: null,
+  hydrated: false,
+  lastSyncedAt: null
+};
+let voiceApiServer = null;
+
+function isVoiceLikeChannel(channel) {
+  if (!channel) return false;
+  const voiceTypes = new Set([
+    2,
+    13,
+    15,
+    'GUILD_VOICE',
+    'GUILD_STAGE_VOICE',
+    'VOICE',
+    'STAGE_VOICE'
+  ]);
+  return voiceTypes.has(channel.type);
+}
+
+function voiceStateToPayload(voiceState) {
+  if (!voiceState) return null;
+  const member = voiceState.member || null;
+  const user = member?.user || client.users.cache.get(voiceState.id) || null;
+  return {
+    id: voiceState.id,
+    username: user?.username || null,
+    discriminator: user?.discriminator || null,
+    globalName: user?.globalName || null,
+    displayName: member?.displayName || user?.username || null,
+    nick: member?.nickname || null,
+    deaf: Boolean(voiceState.deaf || voiceState.serverDeaf),
+    mute: Boolean(voiceState.mute || voiceState.serverMute),
+    selfDeaf: Boolean(voiceState.selfDeaf),
+    selfMute: Boolean(voiceState.selfMute),
+    streaming: Boolean(voiceState.streaming),
+    video: Boolean(voiceState.selfVideo),
+    suppressed: Boolean(voiceState.suppress)
+  };
+}
+
+function fallbackMemberSnapshot(member) {
+  if (!member) return null;
+  const user = member.user || client.users.cache.get(member.id) || null;
+  const voice = member.voice || null;
+  return {
+    id: member.id,
+    username: user?.username || null,
+    discriminator: user?.discriminator || null,
+    globalName: user?.globalName || null,
+    displayName: member.displayName || user?.username || null,
+    nick: member.nickname || null,
+    deaf: Boolean(voice?.deaf || voice?.serverDeaf),
+    mute: Boolean(voice?.mute || voice?.serverMute),
+    selfDeaf: Boolean(voice?.selfDeaf),
+    selfMute: Boolean(voice?.selfMute),
+    streaming: Boolean(voice?.streaming),
+    video: Boolean(voice?.selfVideo),
+    suppressed: Boolean(voice?.suppress)
+  };
+}
+
+async function syncTrackedVoiceUsers(guildId, channelId, { force = false } = {}) {
+  if (!client.isReady()) {
+    throw new Error('Client Discord pas prêt.');
+  }
+  if (!guildId || !channelId) {
+    trackedVoiceUsers.clear();
+    trackedVoiceContext.guildId = guildId || null;
+    trackedVoiceContext.channelId = channelId || null;
+    trackedVoiceContext.hydrated = false;
+    trackedVoiceContext.guildName = null;
+    trackedVoiceContext.channelName = null;
+    trackedVoiceContext.lastSyncedAt = null;
+    return null;
+  }
+
+  let guild;
+  try {
+    guild = await client.guilds.fetch(guildId);
+  } catch (err) {
+    trackedVoiceUsers.clear();
+    trackedVoiceContext.guildId = guildId;
+    trackedVoiceContext.channelId = channelId;
+    trackedVoiceContext.hydrated = false;
+    trackedVoiceContext.guildName = null;
+    trackedVoiceContext.channelName = null;
+    trackedVoiceContext.lastSyncedAt = null;
+    throw new Error(`Guilde introuvable (${err?.message || err}).`);
+  }
+
+  let channel;
+  try {
+    channel = await guild.channels.fetch(channelId);
+  } catch (err) {
+    trackedVoiceUsers.clear();
+    trackedVoiceContext.guildId = guild.id;
+    trackedVoiceContext.channelId = channelId;
+    trackedVoiceContext.hydrated = false;
+    trackedVoiceContext.guildName = guild.name || null;
+    trackedVoiceContext.channelName = null;
+    trackedVoiceContext.lastSyncedAt = null;
+    throw new Error(`Salon introuvable (${err?.message || err}).`);
+  }
+
+  if (!isVoiceLikeChannel(channel)) {
+    throw new Error('Le salon ciblé n\'est pas un salon vocal.');
+  }
+
+  if (force) {
+    try {
+      await guild.members.fetch({ withPresences: false });
+    } catch (err) {
+      console.warn('Impossible de rafraîchir tous les membres de la guilde:', err?.message || err);
+    }
+  }
+
+  trackedVoiceUsers.clear();
+  trackedVoiceContext.guildId = guild.id;
+  trackedVoiceContext.channelId = channel.id;
+  trackedVoiceContext.guildName = guild.name || null;
+  trackedVoiceContext.channelName = channel.name || null;
+  trackedVoiceContext.hydrated = true;
+  trackedVoiceContext.lastSyncedAt = Date.now();
+
+  const voiceStates = guild.voiceStates.cache;
+  for (const state of voiceStates.values()) {
+    if (state.channelId === channel.id) {
+      const payload = voiceStateToPayload(state);
+      if (payload) {
+        trackedVoiceUsers.set(payload.id, payload);
+      }
+    }
+  }
+
+  if (channel.members?.size) {
+    for (const member of channel.members.values()) {
+      if (!member) continue;
+      if (member.voice?.channelId !== channel.id) continue;
+      if (!trackedVoiceUsers.has(member.id)) {
+        let payload = null;
+        try {
+          const fetchedState = await guild.voiceStates.fetch(member.id, { force: true });
+          payload = voiceStateToPayload(fetchedState);
+        } catch (err) {
+          payload = fallbackMemberSnapshot(member);
+        }
+        if (payload) {
+          trackedVoiceUsers.set(member.id, payload);
+        }
+      }
+    }
+  }
+
+  return { guild, channel };
+}
+
+function handleVoiceStateUpdate(oldState, newState) {
+  if (!trackedVoiceContext.guildId || !trackedVoiceContext.channelId) {
+    return;
+  }
+
+  const relevantGuild = trackedVoiceContext.guildId;
+  const relevantChannel = trackedVoiceContext.channelId;
+
+  if (oldState && oldState.guild?.id === relevantGuild && oldState.channelId === relevantChannel) {
+    if (!newState || newState.channelId !== relevantChannel || newState.guild?.id !== relevantGuild) {
+      trackedVoiceUsers.delete(oldState.id);
+      trackedVoiceContext.lastSyncedAt = Date.now();
+    }
+  }
+
+  if (newState && newState.guild?.id === relevantGuild && newState.channelId === relevantChannel) {
+    const payload = voiceStateToPayload(newState);
+    if (payload) {
+      trackedVoiceUsers.set(payload.id, payload);
+      trackedVoiceContext.lastSyncedAt = Date.now();
+    }
+  }
+}
+
+client.on('voiceStateUpdate', handleVoiceStateUpdate);
+
+function buildVoiceUsersResponse({ refreshed }) {
+  return {
+    guildId: trackedVoiceContext.guildId,
+    guildName: trackedVoiceContext.guildName,
+    channelId: trackedVoiceContext.channelId,
+    channelName: trackedVoiceContext.channelName,
+    count: trackedVoiceUsers.size,
+    users: Array.from(trackedVoiceUsers.values()),
+    lastSyncedAt: trackedVoiceContext.lastSyncedAt
+      ? new Date(trackedVoiceContext.lastSyncedAt).toISOString()
+      : null,
+    refreshed: Boolean(refreshed)
+  };
+}
+
+async function voiceUsersRequestHandler(req, res) {
+  const method = (req.method || 'GET').toUpperCase();
+  let requestUrl;
+  try {
+    requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  } catch (err) {
+    res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: 'Requête invalide.' }));
+    return;
+  }
+
+  if (method !== 'GET' || requestUrl.pathname !== '/api/voice/users') {
+    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+    return;
+  }
+
+  const guildIdParam = requestUrl.searchParams.get('guildId');
+  const channelIdParam = requestUrl.searchParams.get('channelId');
+  const refreshParam = requestUrl.searchParams.get('refresh');
+
+  const guildId = guildIdParam || trackedVoiceContext.guildId || AUTO_GUILD_ID || null;
+  let channelId = channelIdParam || trackedVoiceContext.channelId || AUTO_VOICE_CHANNEL_ID || null;
+  if (!channelId && voiceConnection?.joinConfig?.channelId) {
+    channelId = voiceConnection.joinConfig.channelId;
+  }
+
+  if (!guildId || !channelId) {
+    res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: 'guildId et channelId sont requis.' }));
+    return;
+  }
+
+  const needRefresh =
+    refreshParam === '1' ||
+    refreshParam === 'true' ||
+    trackedVoiceContext.guildId !== guildId ||
+    trackedVoiceContext.channelId !== channelId ||
+    !trackedVoiceContext.hydrated;
+
+  try {
+    if (needRefresh) {
+      await syncTrackedVoiceUsers(guildId, channelId, { force: true });
+    }
+    const body = JSON.stringify(buildVoiceUsersResponse({ refreshed: needRefresh }));
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Content-Length': Buffer.byteLength(body)
+    });
+    res.end(body);
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: err?.message || String(err) }));
+  }
+}
+
+function ensureVoiceApiServer() {
+  if (voiceApiServer || Number.isNaN(VOICE_API_PORT)) {
+    return;
+  }
+  voiceApiServer = http.createServer((req, res) => {
+    voiceUsersRequestHandler(req, res).catch((err) => {
+      console.error('Erreur API voix:', err);
+      try {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'Erreur interne du serveur.' }));
+      } catch (writeErr) {
+        console.error('Impossible de répondre à la requête API voix:', writeErr);
+      }
+    });
+  });
+
+  voiceApiServer.on('error', (err) => {
+    console.error('Serveur API voix erreur:', err?.message || err);
+  });
+
+  voiceApiServer.listen(VOICE_API_PORT, VOICE_API_HOST, () => {
+    console.log(`Serveur API voix démarré sur http://${VOICE_API_HOST}:${VOICE_API_PORT}/api/voice/users`);
+  });
+}
+
 client.once('ready', async () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
+
+  ensureVoiceApiServer();
+
+  if (AUTO_GUILD_ID && AUTO_VOICE_CHANNEL_ID) {
+    try {
+      await syncTrackedVoiceUsers(AUTO_GUILD_ID, AUTO_VOICE_CHANNEL_ID, { force: true });
+    } catch (err) {
+      console.warn('Impossible de synchroniser la liste vocale au démarrage:', err?.message || err);
+    }
+  }
 
   // Si GUILD_ID + VOICE_CHANNEL_ID fournis -> tenter auto-join
   if (AUTO_GUILD_ID && AUTO_VOICE_CHANNEL_ID) {
@@ -116,6 +424,12 @@ client.once('ready', async () => {
       });
 
       console.log(`Auto-join : salon vocal ${channel.name} (${channel.id}) sur la guilde ${guild.name} (${guild.id})`);
+
+      try {
+        await syncTrackedVoiceUsers(guild.id, channel.id, { force: false });
+      } catch (syncErr) {
+        console.warn('Impossible de synchroniser la liste vocale après auto-join:', syncErr?.message || syncErr);
+      }
     } catch (err) {
       console.error('Auto-join failed:', err?.message || err);
     }
@@ -219,6 +533,11 @@ client.on('messageCreate', async (msg) => {
         selfDeaf: false,
         selfMute: false
       });
+      try {
+        await syncTrackedVoiceUsers(channel.guild.id, channel.id, { force: true });
+      } catch (err) {
+        console.warn('Impossible de synchroniser la liste vocale après --join-vocal:', err?.message || err);
+      }
       return msg.channel.send(`🔊 Rejoint le salon vocal **${channel.name}**.`);
     }
 
@@ -255,6 +574,18 @@ client.on('messageCreate', async (msg) => {
             selfDeaf: false,
             selfMute: false
           });
+        }
+      }
+
+      if (voiceConnection?.joinConfig?.guildId && voiceConnection.joinConfig.channelId) {
+        try {
+          await syncTrackedVoiceUsers(
+            voiceConnection.joinConfig.guildId,
+            voiceConnection.joinConfig.channelId,
+            { force: false }
+          );
+        } catch (err) {
+          console.warn('Impossible de synchroniser la liste vocale après --start-music:', err?.message || err);
         }
       }
 

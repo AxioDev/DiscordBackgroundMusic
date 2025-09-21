@@ -27,6 +27,25 @@ node index.js
 
 Optional environment variables `GUILD_ID` and `VOICE_CHANNEL_ID` let the bot auto-join a voice channel on startup.
 
+### Voice user API
+
+When the bot is running it also exposes a small HTTP endpoint that returns the people currently connected to the tracked voice
+channel. The server listens on `0.0.0.0:3000` by default. You can customise the binding through the optional environment
+variables `VOICE_API_PORT` (or `API_PORT`/`PORT`) and `VOICE_API_HOST`.
+
+```
+GET /api/voice/users
+```
+
+Query parameters:
+
+- `guildId` and `channelId` (optional) target a specific guild/channel combination. When omitted, the bot falls back to the
+  auto-join environment variables or the last joined voice channel.
+- `refresh` (`1`/`true`) forces the bot to re-synchronise the user list with Discord before returning the payload.
+
+The endpoint responds with a JSON payload containing the guild/channel metadata, `count`, and an array of user snapshots
+(`id`, `displayName`, `username`, `mute`/`deaf` flags, etc.).
+
 ## Docker
 
 A Dockerfile and docker-compose.yml are included. Build and run with:
