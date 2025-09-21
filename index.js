@@ -10,14 +10,14 @@ if (typeof globalThis.File === 'undefined' && typeof bufferModule.File === 'func
   globalThis.File = bufferModule.File;
 }
 
-let opusEncoderAvailable = false;
+let opusImplementation = null;
 try {
   require('@discordjs/opus');
-  opusEncoderAvailable = true;
+  opusImplementation = '@discordjs/opus';
 } catch (opusErr) {
   try {
     require('opusscript');
-    opusEncoderAvailable = true;
+    opusImplementation = 'opusscript';
   } catch (opusscriptErr) {
     const detail = opusErr?.message || opusscriptErr?.message || 'unknown error';
     console.error(
@@ -26,6 +26,10 @@ try {
     );
     process.exit(1);
   }
+}
+
+if (opusImplementation) {
+  console.log(`Encodeur Opus chargé: ${opusImplementation}`);
 }
 
 // discord.js-selfbot-v13 attend String.prototype.toWellFormed() (Node >=16.9).
