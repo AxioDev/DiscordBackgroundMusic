@@ -105,6 +105,8 @@ let manualStopInProgress = false;
 let autoPlaybackDesired = false;
 let loadingTrackPromise = null;
 let lastAnnounceChannel = null;
+let playbackRequestToken = 0;
+let skipInProgressCount = 0;
 
 client.once('ready', async () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
@@ -303,11 +305,15 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
   }
 
   const connection = voiceConnection;
+  const requestToken = ++playbackRequestToken;
 
   const loadTask = (async () => {
     await waitForVoiceConnectionReady(connection);
     if (voiceConnection !== connection) {
       throw new Error('Connexion vocale modifiée pendant le chargement.');
+    }
+    if (requestToken !== playbackRequestToken) {
+      return null;
     }
     autoPlaybackDesired = true;
     manualStopInProgress = false;
@@ -329,14 +335,44 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
       trackInfo = jamendoData.info;
     }
 
+    if (requestToken !== playbackRequestToken) {
+      if (remoteStream) {
+        try {
+          if (typeof remoteStream.destroy === 'function') {
+            remoteStream.destroy();
+          } else if (typeof remoteStream.cancel === 'function') {
+            remoteStream.cancel();
+          }
+        } catch (cleanupErr) {
+          console.warn('Nettoyage du flux audio après annulation impossible:', cleanupErr?.message || cleanupErr);
+        }
+      }
+      return null;
+    }
+
     const resource = createAudioResource(remoteStream, { inputType: StreamType.Arbitrary, inlineVolume: true });
     if (resource.volume) resource.volume.setVolume(currentVolume);
+    if (requestToken !== playbackRequestToken) {
+      try {
+        if (resource.playStream && typeof resource.playStream.destroy === 'function') {
+          resource.playStream.destroy();
+        }
+      } catch (cleanupErr) {
+        console.warn('Nettoyage de la ressource audio après annulation impossible:', cleanupErr?.message || cleanupErr);
+      }
+      return null;
+    }
     currentResource = resource;
     lastTrackInfo = trackInfo;
     player.play(resource);
     connection.subscribe(player);
 
-    const prefix = reason === 'manual' ? 'Lecture démarrée' : 'Lecture automatique';
+    let prefix = 'Lecture automatique';
+    if (reason === 'manual') {
+      prefix = 'Lecture démarrée';
+    } else if (reason === 'manual-skip') {
+      prefix = 'Piste suivante';
+    }
     const volumeInfo = `(volume ${(currentVolume * 100).toFixed(0)}%)`;
     if (effectiveAnnounceChannel && typeof effectiveAnnounceChannel.send === 'function') {
       let message;
@@ -356,7 +392,7 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
     return trackInfo;
   })();
 
-  loadingTrackPromise = loadTask
+  const trackedPromise = loadTask
     .catch((err) => {
       if (effectiveAnnounceChannel && typeof effectiveAnnounceChannel.send === 'function') {
         effectiveAnnounceChannel.send(`❌ Impossible de démarrer la lecture (${err.message || err}).`).catch(() => {});
@@ -364,12 +400,14 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
       throw err;
     })
     .finally(() => {
-      if (loadingTrackPromise === loadTask) {
+      if (loadingTrackPromise === trackedPromise) {
         loadingTrackPromise = null;
       }
     });
 
-  return loadingTrackPromise;
+  loadingTrackPromise = trackedPromise;
+
+  return trackedPromise;
 }
 
 async function autoStartPlayback({ announceChannel = null, reason = 'auto' } = {}) {
@@ -400,6 +438,9 @@ async function autoStartPlayback({ announceChannel = null, reason = 'auto' } = {
 
 player.on(AudioPlayerStatus.Idle, () => {
   currentResource = null;
+  if (skipInProgressCount > 0) {
+    return;
+  }
   if (manualStopInProgress) {
     manualStopInProgress = false;
     return;
@@ -466,6 +507,53 @@ client.on('messageCreate', async (msg) => {
       } catch (err) {
         return msg.channel.send(`❌ Impossible de démarrer la lecture (${err.message || err}).`);
       }
+      return;
+    }
+
+    else if (cmd === '--skip-music') {
+      try {
+        await ensureVoiceConnection({ msg, autoPlayOnJoin: false, announceChannel: msg.channel });
+      } catch (err) {
+        return msg.channel.send(`❌ ${err.message || 'Impossible de préparer la connexion vocale.'}`);
+      }
+
+      autoPlaybackDesired = true;
+      manualStopInProgress = false;
+      playbackRequestToken++;
+
+      if (loadingTrackPromise) {
+        loadingTrackPromise.catch(() => {});
+        loadingTrackPromise = null;
+      }
+
+      skipInProgressCount++;
+      try {
+        const status = player?.state?.status;
+        if (
+          status === AudioPlayerStatus.Playing ||
+          status === AudioPlayerStatus.Buffering ||
+          status === AudioPlayerStatus.Paused
+        ) {
+          try {
+            player.stop(true);
+          } catch (stopErr) {
+            console.warn('Arrêt du lecteur avant le skip impossible:', stopErr?.message || stopErr);
+          }
+        }
+
+        msg.channel.send('⏭️ Passage à la piste suivante...').catch(() => {});
+
+        await loadAndPlayTrack({ customUrl: null, announceChannel: msg.channel, reason: 'manual-skip' });
+      } catch (err) {
+        console.error('Saut de piste échoué:', err);
+        try {
+          await msg.channel.send(`❌ Impossible de passer à la piste suivante (${err.message || err}).`);
+        } catch (sendErr) {}
+        return;
+      } finally {
+        skipInProgressCount = Math.max(0, skipInProgressCount - 1);
+      }
+
       return;
     }
 
