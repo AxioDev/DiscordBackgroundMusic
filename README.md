@@ -1,6 +1,6 @@
 # Discord Background Music Bot
 
-This project runs a self-hosted Discord music helper that can automatically join a voice channel and stream ambient tracks from Jamendo.
+This project runs a self-hosted Discord music helper that can automatically join a voice channel and stream "atmo" tracks from Jamendo.
 
 ## Requirements
 
@@ -26,7 +26,7 @@ node index.js
 ```
 
 Optional environment variables `GUILD_ID` and `VOICE_CHANNEL_ID` let the bot auto-join a voice channel on startup. You can also
-set `JAMENDO_MUSIC_TAG` to choose the default Jamendo style (defaults to `ambient`). The music tag can be changed at runtime in
+set `JAMENDO_MUSIC_TAG` to choose the default Jamendo style (defaults to `atmo`). The music tag can be changed at runtime in
 Discord with the `--change-music-tag <tag>` command.
 
 ## Docker
