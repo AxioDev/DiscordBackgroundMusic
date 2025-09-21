@@ -107,6 +107,7 @@ let loadingTrackPromise = null;
 let lastAnnounceChannel = null;
 let playbackRequestToken = 0;
 let skipInProgressCount = 0;
+let lastVoiceChannelId = null;
 
 client.once('ready', async () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
@@ -239,6 +240,7 @@ async function connectToVoiceChannel(channel, { autoStartPlayback: shouldAutoSta
   voiceConnection = connection;
   try {
     await waitForVoiceConnectionReady(connection);
+    lastVoiceChannelId = channel.id;
   } catch (err) {
     voiceConnection = null;
     throw err;
@@ -265,6 +267,20 @@ async function ensureVoiceConnection({ msg = null, autoPlayOnJoin = true, announ
       console.warn('Connexion vocale invalide, tentative de reconnexion:', err?.message || err);
       try { voiceConnection.destroy(); } catch (destroyErr) { console.error('Destruction connexion vocale échouée:', destroyErr); }
       voiceConnection = null;
+    }
+  }
+
+  if (!msg && lastVoiceChannelId) {
+    try {
+      if (client?.channels?.fetch) {
+        const channel = await client.channels.fetch(lastVoiceChannelId);
+        if (isVoiceChannel(channel)) {
+          await connectToVoiceChannel(channel, { autoStartPlayback: autoPlayOnJoin, announceChannel });
+          return voiceConnection;
+        }
+      }
+    } catch (err) {
+      console.warn('Reconnexion au dernier salon vocal impossible:', err?.message || err);
     }
   }
 
@@ -411,6 +427,17 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
 }
 
 async function autoStartPlayback({ announceChannel = null, reason = 'auto' } = {}) {
+  const effectiveAnnounceChannel = announceChannel || lastAnnounceChannel || null;
+
+  if (!isVoiceConnectionUsable(voiceConnection)) {
+    try {
+      await ensureVoiceConnection({ autoPlayOnJoin: false, announceChannel: effectiveAnnounceChannel });
+    } catch (err) {
+      console.error('Reconnexion vocale nécessaire impossible:', err?.message || err);
+      return;
+    }
+  }
+
   if (!isVoiceConnectionUsable(voiceConnection)) {
     return;
   }
@@ -428,7 +455,6 @@ async function autoStartPlayback({ announceChannel = null, reason = 'auto' } = {
     return;
   }
 
-  const effectiveAnnounceChannel = announceChannel || lastAnnounceChannel || null;
   try {
     await loadAndPlayTrack({ customUrl: null, announceChannel: effectiveAnnounceChannel, reason });
   } catch (err) {
@@ -450,6 +476,13 @@ player.on(AudioPlayerStatus.Idle, () => {
   }
   autoStartPlayback({ reason: 'auto-next' }).catch((err) => {
     console.error('Echec du démarrage automatique après la fin de piste:', err?.message || err);
+    if (autoPlaybackDesired) {
+      setTimeout(() => {
+        autoStartPlayback({ reason: 'auto-retry' }).catch((retryErr) => {
+          console.error('Nouvelle tentative de lecture automatique échouée:', retryErr?.message || retryErr);
+        });
+      }, 5_000);
+    }
   });
 });
 
