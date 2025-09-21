@@ -109,6 +109,44 @@ let playbackRequestToken = 0;
 let skipInProgressCount = 0;
 let lastVoiceChannelId = null;
 
+const jamendoRecentTrackIds = [];
+const JAMENDO_RECENT_TRACK_HISTORY = 5;
+
+function rememberJamendoTrack(trackId) {
+  if (!trackId) return;
+  const normalized = String(trackId);
+  const existingIndex = jamendoRecentTrackIds.indexOf(normalized);
+  if (existingIndex !== -1) {
+    jamendoRecentTrackIds.splice(existingIndex, 1);
+  }
+  jamendoRecentTrackIds.push(normalized);
+  while (jamendoRecentTrackIds.length > JAMENDO_RECENT_TRACK_HISTORY) {
+    jamendoRecentTrackIds.shift();
+  }
+}
+
+function getNormalizedJamendoId(rawId) {
+  if (rawId === undefined || rawId === null) {
+    return null;
+  }
+  try {
+    return String(rawId);
+  } catch (err) {
+    return null;
+  }
+}
+
+function shuffledCopy(items) {
+  const array = items.slice();
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = array[i];
+    array[i] = array[j];
+    array[j] = tmp;
+  }
+  return array;
+}
+
 client.once('ready', async () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
 
@@ -147,12 +185,38 @@ async function getJamendoAmbientTrackStream() {
   const j = await res.json();
   if (!j.results || j.results.length === 0) throw new Error('Aucune piste trouvée sur Jamendo.');
 
-  let lastStreamError = null;
-
+  const playableTracks = [];
   for (const track of j.results) {
     if (!track || !track.audio) continue;
     if (track.audiodownload_allowed === false) continue; // piste non téléchargeable => éviter les 404
+    playableTracks.push({
+      track,
+      jamendoId: getNormalizedJamendoId(track.id)
+    });
+  }
 
+  if (playableTracks.length === 0) {
+    throw new Error('Aucune piste Jamendo lisible trouvée.');
+  }
+
+  const previousJamendoId = getNormalizedJamendoId(lastTrackInfo?.jamendoId);
+  const recentIds = new Set(jamendoRecentTrackIds);
+  const preferred = [];
+  const fallback = [];
+
+  for (const item of playableTracks) {
+    const { jamendoId } = item;
+    if (jamendoId && (jamendoId === previousJamendoId || recentIds.has(jamendoId))) {
+      fallback.push(item);
+    } else {
+      preferred.push(item);
+    }
+  }
+
+  const selectionOrder = [...shuffledCopy(preferred), ...shuffledCopy(fallback)];
+  let lastStreamError = null;
+
+  for (const { track, jamendoId } of selectionOrder) {
     let audioUrl = track.audio;
     try {
       const parsed = new URL(audioUrl);
@@ -173,7 +237,8 @@ async function getJamendoAmbientTrackStream() {
           audioUrl,
           name: track.name || 'Piste Jamendo',
           artist: track.artist_name || 'Artiste Jamendo',
-          licenseUrl
+          licenseUrl,
+          jamendoId
         }
       };
     } catch (err) {
@@ -381,6 +446,9 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
     }
     currentResource = resource;
     lastTrackInfo = trackInfo;
+    if (trackInfo && trackInfo.jamendoId) {
+      rememberJamendoTrack(trackInfo.jamendoId);
+    }
     player.play(resource);
     connection.subscribe(player);
 
