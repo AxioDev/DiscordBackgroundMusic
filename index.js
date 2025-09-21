@@ -78,7 +78,7 @@ function sanitizeMusicTag(rawTag) {
   return trimmed.toLowerCase().replace(/\s+/g, '-');
 }
 
-const DEFAULT_JAMENDO_TAG = sanitizeMusicTag(process.env.JAMENDO_MUSIC_TAG) || 'ambient';
+const DEFAULT_JAMENDO_TAG = sanitizeMusicTag(process.env.JAMENDO_MUSIC_TAG) || 'atmo';
 let currentJamendoTag = DEFAULT_JAMENDO_TAG;
 
 if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
@@ -111,7 +111,7 @@ const client = new Client({
 let voiceConnection = null;
 const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
 let currentResource = null;
-let currentVolume = 0.05; // 5% par défaut
+let currentVolume = 0.01; // 1% par défaut
 let lastTrackInfo = null;
 let manualStopInProgress = false;
 let autoPlaybackDesired = false;
