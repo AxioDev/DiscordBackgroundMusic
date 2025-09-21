@@ -55,7 +55,16 @@ if (typeof ''.toWellFormed !== 'function') {
 }
 
 const { Client, GatewayIntentBits } = require('discord.js-selfbot-v13');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior } = require('@discordjs/voice');
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  StreamType,
+  NoSubscriberBehavior,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  entersState
+} = require('@discordjs/voice');
 const fetch = require('node-fetch'); // node 18+ peut utiliser global fetch
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const JAMENDO_CLIENT_ID = process.env.JAMENDO_CLIENT_ID;
@@ -91,6 +100,11 @@ let voiceConnection = null;
 const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
 let currentResource = null;
 let currentVolume = 0.05; // 5% par défaut
+let lastTrackInfo = null;
+let manualStopInProgress = false;
+let autoPlaybackDesired = false;
+let loadingTrackPromise = null;
+let lastAnnounceChannel = null;
 
 client.once('ready', async () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
@@ -98,23 +112,14 @@ client.once('ready', async () => {
   // Si GUILD_ID + VOICE_CHANNEL_ID fournis -> tenter auto-join
   if (AUTO_GUILD_ID && AUTO_VOICE_CHANNEL_ID) {
     try {
-      // s'assurer que la guild est disponible
       const guild = await client.guilds.fetch(AUTO_GUILD_ID);
       const channel = await guild.channels.fetch(AUTO_VOICE_CHANNEL_ID);
-
-      if (!channel || channel.type !== 2 && channel.type !== 'GUILD_VOICE' && channel.type !== 'GUILD_STAGE_VOICE') {
+      if (!isVoiceChannel(channel)) {
         console.warn('Le channel spécifié n\'est pas un salon vocal ou est introuvable.');
         return;
       }
 
-      voiceConnection = joinVoiceChannel({
-        channelId: channel.id,
-        guildId: guild.id,
-        adapterCreator: guild.voiceAdapterCreator || channel.guild.voiceAdapterCreator,
-        selfDeaf: false,
-        selfMute: false
-      });
-
+      await connectToVoiceChannel(channel, { autoStartPlayback: true });
       console.log(`Auto-join : salon vocal ${channel.name} (${channel.id}) sur la guilde ${guild.name} (${guild.id})`);
     } catch (err) {
       console.error('Auto-join failed:', err?.message || err);
@@ -194,6 +199,232 @@ async function fetchAudioStream(url, label = 'source distante') {
   return response.body;
 }
 
+function isVoiceChannel(channel) {
+  if (!channel) return false;
+  return channel.type === 2 || channel.type === 'GUILD_VOICE' || channel.type === 'GUILD_STAGE_VOICE';
+}
+
+function isVoiceConnectionUsable(connection) {
+  return Boolean(connection && connection.state && connection.state.status !== VoiceConnectionStatus.Destroyed);
+}
+
+async function waitForVoiceConnectionReady(connection) {
+  if (!connection) {
+    throw new Error('Aucune connexion vocale active.');
+  }
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+  } catch (err) {
+    try { connection.destroy(); } catch (destroyErr) { console.error('Destruction connexion vocale échouée:', destroyErr); }
+    throw err;
+  }
+  return connection;
+}
+
+async function connectToVoiceChannel(channel, { autoStartPlayback: shouldAutoStart = true, announceChannel = null } = {}) {
+  if (!isVoiceChannel(channel)) {
+    throw new Error('Le salon spécifié n\'est pas un salon vocal.');
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: channel.guild.id,
+    adapterCreator: channel.guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false
+  });
+
+  voiceConnection = connection;
+  try {
+    await waitForVoiceConnectionReady(connection);
+  } catch (err) {
+    voiceConnection = null;
+    throw err;
+  }
+
+  autoPlaybackDesired = shouldAutoStart;
+  if (shouldAutoStart) {
+    setImmediate(() => {
+      autoStartPlayback({ announceChannel, reason: 'auto-join' }).catch((error) => {
+        console.error('Lecture automatique après connexion échouée:', error?.message || error);
+      });
+    });
+  }
+
+  return connection;
+}
+
+async function ensureVoiceConnection({ msg = null, autoPlayOnJoin = true, announceChannel = null } = {}) {
+  if (isVoiceConnectionUsable(voiceConnection)) {
+    try {
+      await waitForVoiceConnectionReady(voiceConnection);
+      return voiceConnection;
+    } catch (err) {
+      console.warn('Connexion vocale invalide, tentative de reconnexion:', err?.message || err);
+      try { voiceConnection.destroy(); } catch (destroyErr) { console.error('Destruction connexion vocale échouée:', destroyErr); }
+      voiceConnection = null;
+    }
+  }
+
+  if (AUTO_GUILD_ID && AUTO_VOICE_CHANNEL_ID) {
+    try {
+      const guild = await client.guilds.fetch(AUTO_GUILD_ID);
+      const channel = await guild.channels.fetch(AUTO_VOICE_CHANNEL_ID);
+      if (isVoiceChannel(channel)) {
+        await connectToVoiceChannel(channel, { autoStartPlayback: autoPlayOnJoin, announceChannel });
+        return voiceConnection;
+      }
+      console.warn('Le channel spécifié n\'est pas un salon vocal ou est introuvable.');
+    } catch (err) {
+      console.error('Connexion automatique via variables d\'env impossible:', err?.message || err);
+    }
+  }
+
+  if (msg) {
+    const member = msg.member;
+    if (!member || !member.voice || !member.voice.channel) {
+      throw new Error('Rejoins un salon vocal puis relance la commande.');
+    }
+    await connectToVoiceChannel(member.voice.channel, { autoStartPlayback: autoPlayOnJoin, announceChannel });
+    return voiceConnection;
+  }
+
+  throw new Error('Pas de connexion vocale disponible.');
+}
+
+async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reason = 'manual' } = {}) {
+  if (!isVoiceConnectionUsable(voiceConnection)) {
+    throw new Error('Pas de connexion vocale active.');
+  }
+
+  const effectiveAnnounceChannel = announceChannel || lastAnnounceChannel || null;
+  if (announceChannel) {
+    lastAnnounceChannel = announceChannel;
+  }
+
+  const connection = voiceConnection;
+
+  const loadTask = (async () => {
+    await waitForVoiceConnectionReady(connection);
+    if (voiceConnection !== connection) {
+      throw new Error('Connexion vocale modifiée pendant le chargement.');
+    }
+    autoPlaybackDesired = true;
+    manualStopInProgress = false;
+
+    let remoteStream;
+    let trackInfo = null;
+
+    if (customUrl) {
+      remoteStream = await fetchAudioStream(customUrl, 'la source fournie');
+      trackInfo = {
+        name: 'Source fournie',
+        artist: customUrl,
+        audioUrl: customUrl,
+        licenseUrl: null
+      };
+    } else {
+      const jamendoData = await getJamendoAmbientTrackStream();
+      remoteStream = jamendoData.stream;
+      trackInfo = jamendoData.info;
+    }
+
+    const resource = createAudioResource(remoteStream, { inputType: StreamType.Arbitrary, inlineVolume: true });
+    if (resource.volume) resource.volume.setVolume(currentVolume);
+    currentResource = resource;
+    lastTrackInfo = trackInfo;
+    player.play(resource);
+    connection.subscribe(player);
+
+    const prefix = reason === 'manual' ? 'Lecture démarrée' : 'Lecture automatique';
+    const volumeInfo = `(volume ${(currentVolume * 100).toFixed(0)}%)`;
+    if (effectiveAnnounceChannel && typeof effectiveAnnounceChannel.send === 'function') {
+      let message;
+      if (!customUrl && trackInfo) {
+        const licensePart = trackInfo.licenseUrl ? ` (licence: ${trackInfo.licenseUrl})` : '';
+        message = `▶️ ${prefix} : **${trackInfo.name}** — ${trackInfo.artist}${licensePart} ${volumeInfo}`;
+      } else if (customUrl) {
+        message = `▶️ ${prefix} depuis la source fournie ${volumeInfo}`;
+      } else {
+        message = `▶️ ${prefix} ${volumeInfo}`;
+      }
+      effectiveAnnounceChannel.send(message.trim()).catch(() => {});
+    } else if (trackInfo) {
+      console.log(`${prefix} : ${trackInfo.name} — ${trackInfo.artist}`);
+    }
+
+    return trackInfo;
+  })();
+
+  loadingTrackPromise = loadTask
+    .catch((err) => {
+      if (effectiveAnnounceChannel && typeof effectiveAnnounceChannel.send === 'function') {
+        effectiveAnnounceChannel.send(`❌ Impossible de démarrer la lecture (${err.message || err}).`).catch(() => {});
+      }
+      throw err;
+    })
+    .finally(() => {
+      if (loadingTrackPromise === loadTask) {
+        loadingTrackPromise = null;
+      }
+    });
+
+  return loadingTrackPromise;
+}
+
+async function autoStartPlayback({ announceChannel = null, reason = 'auto' } = {}) {
+  if (!isVoiceConnectionUsable(voiceConnection)) {
+    return;
+  }
+  if (player.state.status === AudioPlayerStatus.Playing || player.state.status === AudioPlayerStatus.Buffering) {
+    return;
+  }
+  if (loadingTrackPromise) {
+    return loadingTrackPromise.catch(() => {});
+  }
+
+  try {
+    await waitForVoiceConnectionReady(voiceConnection);
+  } catch (err) {
+    console.error('Connexion vocale indisponible pour la lecture automatique:', err?.message || err);
+    return;
+  }
+
+  const effectiveAnnounceChannel = announceChannel || lastAnnounceChannel || null;
+  try {
+    await loadAndPlayTrack({ customUrl: null, announceChannel: effectiveAnnounceChannel, reason });
+  } catch (err) {
+    console.error('Lecture automatique échouée:', err?.message || err);
+  }
+}
+
+player.on(AudioPlayerStatus.Idle, () => {
+  currentResource = null;
+  if (manualStopInProgress) {
+    manualStopInProgress = false;
+    return;
+  }
+  if (!autoPlaybackDesired) {
+    return;
+  }
+  autoStartPlayback({ reason: 'auto-next' }).catch((err) => {
+    console.error('Echec du démarrage automatique après la fin de piste:', err?.message || err);
+  });
+});
+
+player.on('error', (err) => {
+  console.error('Erreur du lecteur audio:', err);
+  currentResource = null;
+  if (!autoPlaybackDesired) {
+    return;
+  }
+  setTimeout(() => {
+    autoStartPlayback({ reason: 'player-error' }).catch((error) => {
+      console.error('Redémarrage automatique après erreur échoué:', error?.message || error);
+    });
+  }, 1500);
+});
+
 client.on('messageCreate', async (msg) => {
   if (msg.author.bot) return;
   if (!msg.content.startsWith('--')) return;
@@ -208,90 +439,50 @@ client.on('messageCreate', async (msg) => {
 
   try {
     if (cmd === '--join-vocal') {
-      // rejoint le salon vocal de l'auteur du message
       const member = msg.member;
-      if (!member || !member.voice || !member.voice.channel) return msg.channel.send('Rejoins un salon vocal puis relance la commande.');
+      if (!member || !member.voice || !member.voice.channel) {
+        return msg.channel.send('Rejoins un salon vocal puis relance la commande.');
+      }
       const channel = member.voice.channel;
-      voiceConnection = joinVoiceChannel({
-        channelId: channel.id,
-        guildId: channel.guild.id,
-        adapterCreator: channel.guild.voiceAdapterCreator,
-        selfDeaf: false,
-        selfMute: false
-      });
-      return msg.channel.send(`🔊 Rejoint le salon vocal **${channel.name}**.`);
+      try {
+        await connectToVoiceChannel(channel, { autoStartPlayback: true, announceChannel: msg.channel });
+      } catch (err) {
+        console.error('Connexion vocale impossible:', err);
+        return msg.channel.send(`❌ Impossible de rejoindre le salon vocal (${err.message || err}).`);
+      }
+      return msg.channel.send(`🔊 Rejoint le salon vocal **${channel.name}**. Lecture automatique en cours.`);
     }
 
     else if (cmd === '--start-music') {
-      // Si pas connecté, tente d'utiliser la connexion auto (env) sinon tente de joindre l'auteur
-      if (!voiceConnection) {
-        if (AUTO_GUILD_ID && AUTO_VOICE_CHANNEL_ID) {
-          // si env présentes mais pas connectées (peut-être join échoué au démarrage), tenter à nouveau
-          try {
-            const guild = await client.guilds.fetch(AUTO_GUILD_ID);
-            const channel = await guild.channels.fetch(AUTO_VOICE_CHANNEL_ID);
-            voiceConnection = joinVoiceChannel({
-              channelId: channel.id,
-              guildId: guild.id,
-              adapterCreator: channel.guild.voiceAdapterCreator,
-              selfDeaf: false,
-              selfMute: false
-            });
-          } catch (err) {
-            // ignore, on essayera de joindre l'auteur ensuite
-          }
-        }
-
-        if (!voiceConnection) {
-          const member = msg.member;
-          if (!member || !member.voice || !member.voice.channel) {
-            return msg.channel.send('Pas de connexion vocale : utilise --join-vocal ou définis GUILD_ID + VOICE_CHANNEL_ID en env.');
-          }
-          const channel = member.voice.channel;
-          voiceConnection = joinVoiceChannel({
-            channelId: channel.id,
-            guildId: channel.guild.id,
-            adapterCreator: channel.guild.voiceAdapterCreator,
-            selfDeaf: false,
-            selfMute: false
-          });
-        }
+      try {
+        await ensureVoiceConnection({ msg, autoPlayOnJoin: false, announceChannel: msg.channel });
+      } catch (err) {
+        return msg.channel.send(`❌ ${err.message || 'Impossible de préparer la connexion vocale.'}`);
       }
 
-      // support : --start-music <url> ou fallback sur Jamendo
-      const source = arg;
-      let resource;
-      if (source) {
-        // si c'est un URL, stream direct via fetch/ytdl selon type (ici on traite comme URL mp3)
-        try {
-          const remoteStream = await fetchAudioStream(source, 'la source fournie');
-          resource = createAudioResource(remoteStream, { inputType: StreamType.Arbitrary, inlineVolume: true });
-        } catch (err) {
-          return msg.channel.send(`Impossible de récupérer la source fournie (${err.message}).`);
-        }
-      } else {
-        // récupérer une piste Jamendo
-        const { stream: remoteStream, info: trackInfo } = await getJamendoAmbientTrackStream();
-        resource = createAudioResource(remoteStream, { inputType: StreamType.Arbitrary, inlineVolume: true });
-        // on peut informer l'utilisateur
-        const licensePart = trackInfo.licenseUrl ? ` (license: ${trackInfo.licenseUrl})` : '';
-        msg.channel.send(`▶️ Lecture préparée : **${trackInfo.name}** — ${trackInfo.artist}${licensePart}`).catch(()=>{});
+      const source = arg || null;
+      try {
+        await loadAndPlayTrack({ customUrl: source, announceChannel: msg.channel, reason: 'manual' });
+      } catch (err) {
+        return msg.channel.send(`❌ Impossible de démarrer la lecture (${err.message || err}).`);
       }
-
-      if (resource.volume) resource.volume.setVolume(currentVolume);
-      currentResource = resource;
-      player.play(resource);
-      voiceConnection.subscribe(player);
-      return msg.channel.send(`▶️ Lecture démarrée (volume ${(currentVolume*100).toFixed(0)}%).`);
+      return;
     }
 
     else if (cmd === '--stop-music') {
+      autoPlaybackDesired = false;
+      manualStopInProgress = true;
+      if (loadingTrackPromise) {
+        loadingTrackPromise.catch(() => {});
+        loadingTrackPromise = null;
+      }
       player.stop();
       if (voiceConnection) {
         try { voiceConnection.destroy(); } catch(e){}
         voiceConnection = null;
       }
       currentResource = null;
+      lastTrackInfo = null;
       return msg.channel.send('⏹ Musique arrêtée et déconnectée.');
     }
 
