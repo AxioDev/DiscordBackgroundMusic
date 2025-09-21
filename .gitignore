@@ -1,0 +1,34 @@
+# Dépendances
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build
+dist/
+build/
+coverage/
+.cache/
+
+# Fichiers d'environnement / config sensibles
+.env
+.env.local
+.env.*.local
+config.json
+
+# Logs
+logs
+*.log
+logs/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / éditeurs
+.vscode/
+.idea/
+*.swp
+
+# Tests temporaires
+*.test.js.snap
