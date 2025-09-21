@@ -10,6 +10,24 @@ if (typeof globalThis.File === 'undefined' && typeof bufferModule.File === 'func
   globalThis.File = bufferModule.File;
 }
 
+let opusEncoderAvailable = false;
+try {
+  require('@discordjs/opus');
+  opusEncoderAvailable = true;
+} catch (opusErr) {
+  try {
+    require('opusscript');
+    opusEncoderAvailable = true;
+  } catch (opusscriptErr) {
+    const detail = opusErr?.message || opusscriptErr?.message || 'unknown error';
+    console.error(
+      'Aucun encodeur Opus détecté. Installe @discordjs/opus (recommandé) ou opusscript pour pouvoir encoder l\'audio.\n' +
+      `Détail: ${detail}`
+    );
+    process.exit(1);
+  }
+}
+
 // discord.js-selfbot-v13 attend String.prototype.toWellFormed() (Node >=16.9).
 // Certains environnements (versions LTS plus anciennes) ne l'exposent pas : on ajoute
 // un polyfill minimal convertissant toute paire suppléante isolée en U+FFFD.
