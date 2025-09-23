@@ -91,6 +91,33 @@ console.log(`Tag Jamendo initial: ${currentJamendoTag}`);
 const ALLOWED_USER_ID = '216189520872210444';
 const ALLOWED_ROLE_NAMES = ['Radio', 'Modo', 'Medium'];
 
+function buildCommandsHelpMessage(definitions) {
+  const header = '📖 **Commandes disponibles**';
+  const lines = definitions.map((def) => `• ${def.name} : ${def.description}`);
+  return [header, ...lines].join('\n');
+}
+
+function buildCommandsBioText(definitions) {
+  const baseText = `Cmds: ${definitions.map((def) => def.name).join(', ')}`;
+  if (baseText.length <= 190) {
+    return baseText;
+  }
+  return `${baseText.slice(0, 187)}…`;
+}
+
+const COMMAND_DEFINITIONS = [
+  { name: '--help', description: 'Affiche cette aide.' },
+  { name: '--join-vocal', description: 'Fait rejoindre ton salon vocal et démarre la musique.' },
+  { name: '--start-music', description: 'Lance la musique (ou une URL audio fournie).' },
+  { name: '--skip-music', description: 'Passe à la piste Jamendo suivante.' },
+  { name: '--stop-music', description: 'Arrête la musique et quitte le vocal.' },
+  { name: '--change-music-tag', description: 'Change le style Jamendo utilisé pour la lecture.' },
+  { name: '--change-volume', description: 'Ajuste le volume du flux audio.' }
+];
+
+const COMMANDS_HELP_MESSAGE = buildCommandsHelpMessage(COMMAND_DEFINITIONS);
+const COMMANDS_BIO_TEXT = buildCommandsBioText(COMMAND_DEFINITIONS);
+
 function isAuthorizedUser(message) {
   if (message.author.id === ALLOWED_USER_ID) {
     return true;
@@ -123,6 +150,27 @@ let lastVoiceChannelId = null;
 
 const jamendoRecentTrackIdsByTag = new Map();
 const JAMENDO_RECENT_TRACK_HISTORY = 5;
+
+async function updateBotCommandBio() {
+  const user = client?.user;
+  if (!user || typeof user.setAboutMe !== 'function') {
+    return;
+  }
+
+  const currentBio = typeof user.bio === 'string' ? user.bio : '';
+  const desiredBio = COMMANDS_BIO_TEXT;
+
+  if (currentBio === desiredBio) {
+    return;
+  }
+
+  try {
+    await user.setAboutMe(desiredBio);
+    console.log('Description mise à jour avec la liste des commandes.');
+  } catch (err) {
+    console.error('Impossible de mettre à jour la description:', err?.message || err);
+  }
+}
 
 function getJamendoHistoryBucket(tag) {
   const key = tag || '';
@@ -179,6 +227,8 @@ function shuffledCopy(items) {
 
 client.once('ready', async () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
+
+  await updateBotCommandBio();
 
   // Si GUILD_ID + VOICE_CHANNEL_ID fournis -> tenter auto-join
   if (AUTO_GUILD_ID && AUTO_VOICE_CHANNEL_ID) {
@@ -614,7 +664,11 @@ client.on('messageCreate', async (msg) => {
   const arg = parts[1];
 
   try {
-    if (cmd === '--join-vocal') {
+    if (cmd === '--help') {
+      return msg.channel.send(COMMANDS_HELP_MESSAGE);
+    }
+
+    else if (cmd === '--join-vocal') {
       const member = msg.member;
       if (!member || !member.voice || !member.voice.channel) {
         return msg.channel.send('Rejoins un salon vocal puis relance la commande.');
