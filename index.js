@@ -71,6 +71,25 @@ const JAMENDO_CLIENT_ID = process.env.JAMENDO_CLIENT_ID;
 const AUTO_GUILD_ID = process.env.GUILD_ID || null;
 const AUTO_VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || null;
 
+function resolveDefaultVolumePercent() {
+  const rawValue = process.env.DEFAULT_VOLUME_PERCENT;
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return 1;
+  }
+
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) {
+    console.warn(
+      `DEFAULT_VOLUME_PERCENT invalide (« ${rawValue} »). La valeur 1% sera utilisée par défaut.`
+    );
+    return 1;
+  }
+
+  return Math.max(0, Math.min(200, parsed));
+}
+
+const DEFAULT_VOLUME_PERCENT = resolveDefaultVolumePercent();
+
 function sanitizeMusicTag(rawTag) {
   if (typeof rawTag !== 'string') return null;
   const trimmed = rawTag.trim();
@@ -87,6 +106,7 @@ if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
 }
 
 console.log(`Tag Jamendo initial: ${currentJamendoTag}`);
+console.log(`Volume initial configuré à ${DEFAULT_VOLUME_PERCENT}%`);
 
 const ALLOWED_USER_ID = '216189520872210444';
 const ALLOWED_ROLE_NAMES = ['Radio', 'Modo', 'Medium'];
@@ -111,7 +131,7 @@ const client = new Client({
 let voiceConnection = null;
 const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
 let currentResource = null;
-let currentVolume = 0.01; // 1% par défaut
+let currentVolume = DEFAULT_VOLUME_PERCENT / 100; // 1% par défaut
 let lastTrackInfo = null;
 let manualStopInProgress = false;
 let autoPlaybackDesired = false;
