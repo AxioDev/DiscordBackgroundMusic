@@ -71,6 +71,58 @@ const JAMENDO_CLIENT_ID = process.env.JAMENDO_CLIENT_ID;
 const AUTO_GUILD_ID = process.env.GUILD_ID || null;
 const AUTO_VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || null;
 
+function parseDeleteDelay(rawValue, fallback) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return fallback;
+  }
+  const numeric = Number(rawValue);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  const normalized = Math.max(0, Math.floor(numeric));
+  return normalized;
+}
+
+const MESSAGE_DELETE_DELAY_MS = parseDeleteDelay(process.env.MESSAGE_DELETE_DELAY_MS, 1_000);
+
+function scheduleMessageDeletion(message, delayMs = MESSAGE_DELETE_DELAY_MS) {
+  if (!message || typeof message.delete !== 'function') {
+    return;
+  }
+  const effectiveDelay = Number.isFinite(delayMs) ? delayMs : MESSAGE_DELETE_DELAY_MS;
+  if (!(effectiveDelay > 0)) {
+    return;
+  }
+  setTimeout(() => {
+    try {
+      message.delete().catch(() => {});
+    } catch (err) {}
+  }, effectiveDelay);
+}
+
+function sendWithAutoDelete(target, content, options = {}) {
+  if (!target || typeof target.send !== 'function') {
+    return Promise.reject(new Error('Invalid target for sendWithAutoDelete'));
+  }
+
+  const {
+    deleteDelayMs = MESSAGE_DELETE_DELAY_MS,
+    suppressErrors = false
+  } = options || {};
+
+  return Promise.resolve(target.send(content))
+    .then((message) => {
+      scheduleMessageDeletion(message, deleteDelayMs);
+      return message;
+    })
+    .catch((err) => {
+      if (suppressErrors) {
+        return null;
+      }
+      throw err;
+    });
+}
+
 function sanitizeMusicTag(rawTag) {
   if (typeof rawTag !== 'string') return null;
   const trimmed = rawTag.trim();
@@ -87,6 +139,7 @@ if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
 }
 
 console.log(`Tag Jamendo initial: ${currentJamendoTag}`);
+console.log(`Suppression automatique des messages après ${MESSAGE_DELETE_DELAY_MS} ms${MESSAGE_DELETE_DELAY_MS === 0 ? ' (désactivée)' : ''}.`);
 
 const ALLOWED_USER_ID = '216189520872210444';
 const ALLOWED_ROLE_NAMES = ['Radio', 'Modo', 'Medium'];
@@ -502,7 +555,7 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
       } else {
         message = `▶️ ${prefix} ${volumeInfo}`;
       }
-      effectiveAnnounceChannel.send(message.trim()).catch(() => {});
+      sendWithAutoDelete(effectiveAnnounceChannel, message.trim(), { suppressErrors: true });
     } else if (trackInfo) {
       console.log(`${prefix} : ${trackInfo.name} — ${trackInfo.artist}`);
     }
@@ -513,7 +566,11 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
   const trackedPromise = loadTask
     .catch((err) => {
       if (effectiveAnnounceChannel && typeof effectiveAnnounceChannel.send === 'function') {
-        effectiveAnnounceChannel.send(`❌ Impossible de démarrer la lecture (${err.message || err}).`).catch(() => {});
+        sendWithAutoDelete(
+          effectiveAnnounceChannel,
+          `❌ Impossible de démarrer la lecture (${err.message || err}).`,
+          { suppressErrors: true }
+        );
       }
       throw err;
     })
@@ -606,7 +663,7 @@ client.on('messageCreate', async (msg) => {
   if (!msg.content.startsWith('--')) return;
 
   if (!isAuthorizedUser(msg)) {
-    return msg.channel.send('❌ Tu n\'es pas autorisé à utiliser ce bot.');
+    return sendWithAutoDelete(msg.channel, '❌ Tu n\'es pas autorisé à utiliser ce bot.');
   }
 
   const parts = msg.content.trim().split(/\s+/);
@@ -617,30 +674,42 @@ client.on('messageCreate', async (msg) => {
     if (cmd === '--join-vocal') {
       const member = msg.member;
       if (!member || !member.voice || !member.voice.channel) {
-        return msg.channel.send('Rejoins un salon vocal puis relance la commande.');
+        return sendWithAutoDelete(msg.channel, 'Rejoins un salon vocal puis relance la commande.');
       }
       const channel = member.voice.channel;
       try {
         await connectToVoiceChannel(channel, { autoStartPlayback: true, announceChannel: msg.channel });
       } catch (err) {
         console.error('Connexion vocale impossible:', err);
-        return msg.channel.send(`❌ Impossible de rejoindre le salon vocal (${err.message || err}).`);
+        return sendWithAutoDelete(
+          msg.channel,
+          `❌ Impossible de rejoindre le salon vocal (${err.message || err}).`
+        );
       }
-      return msg.channel.send(`🔊 Rejoint le salon vocal **${channel.name}**. Lecture automatique en cours.`);
+      return sendWithAutoDelete(
+        msg.channel,
+        `🔊 Rejoint le salon vocal **${channel.name}**. Lecture automatique en cours.`
+      );
     }
 
     else if (cmd === '--start-music') {
       try {
         await ensureVoiceConnection({ msg, autoPlayOnJoin: false, announceChannel: msg.channel });
       } catch (err) {
-        return msg.channel.send(`❌ ${err.message || 'Impossible de préparer la connexion vocale.'}`);
+        return sendWithAutoDelete(
+          msg.channel,
+          `❌ ${err.message || 'Impossible de préparer la connexion vocale.'}`
+        );
       }
 
       const source = arg || null;
       try {
         await loadAndPlayTrack({ customUrl: source, announceChannel: msg.channel, reason: 'manual' });
       } catch (err) {
-        return msg.channel.send(`❌ Impossible de démarrer la lecture (${err.message || err}).`);
+        return sendWithAutoDelete(
+          msg.channel,
+          `❌ Impossible de démarrer la lecture (${err.message || err}).`
+        );
       }
       return;
     }
@@ -649,7 +718,10 @@ client.on('messageCreate', async (msg) => {
       try {
         await ensureVoiceConnection({ msg, autoPlayOnJoin: false, announceChannel: msg.channel });
       } catch (err) {
-        return msg.channel.send(`❌ ${err.message || 'Impossible de préparer la connexion vocale.'}`);
+        return sendWithAutoDelete(
+          msg.channel,
+          `❌ ${err.message || 'Impossible de préparer la connexion vocale.'}`
+        );
       }
 
       autoPlaybackDesired = true;
@@ -676,13 +748,17 @@ client.on('messageCreate', async (msg) => {
           }
         }
 
-        msg.channel.send('⏭️ Passage à la piste suivante...').catch(() => {});
+        sendWithAutoDelete(msg.channel, '⏭️ Passage à la piste suivante...', { suppressErrors: true });
 
         await loadAndPlayTrack({ customUrl: null, announceChannel: msg.channel, reason: 'manual-skip' });
       } catch (err) {
         console.error('Saut de piste échoué:', err);
         try {
-          await msg.channel.send(`❌ Impossible de passer à la piste suivante (${err.message || err}).`);
+          await sendWithAutoDelete(
+            msg.channel,
+            `❌ Impossible de passer à la piste suivante (${err.message || err}).`,
+            { suppressErrors: true }
+          );
         } catch (sendErr) {}
         return;
       } finally {
@@ -706,37 +782,51 @@ client.on('messageCreate', async (msg) => {
       }
       currentResource = null;
       lastTrackInfo = null;
-      return msg.channel.send('⏹ Musique arrêtée et déconnectée.');
+      return sendWithAutoDelete(msg.channel, '⏹ Musique arrêtée et déconnectée.');
     }
 
     else if (cmd === '--change-music-tag') {
       const requestedTagRaw = parts.slice(1).join(' ');
       if (!requestedTagRaw) {
-        return msg.channel.send(`🎶 Tag Jamendo actuel : **${currentJamendoTag}**. Usage: --change-music-tag <tag>`);
+        return sendWithAutoDelete(
+          msg.channel,
+          `🎶 Tag Jamendo actuel : **${currentJamendoTag}**. Usage: --change-music-tag <tag>`
+        );
       }
       const sanitizedTag = sanitizeMusicTag(requestedTagRaw);
       if (!sanitizedTag) {
-        return msg.channel.send('❌ Tag invalide. Exemple: --change-music-tag jazz');
+        return sendWithAutoDelete(msg.channel, '❌ Tag invalide. Exemple: --change-music-tag jazz');
       }
       if (sanitizedTag === currentJamendoTag) {
-        return msg.channel.send(`ℹ️ Le style est déjà défini sur **${currentJamendoTag}**.`);
+        return sendWithAutoDelete(
+          msg.channel,
+          `ℹ️ Le style est déjà défini sur **${currentJamendoTag}**.`
+        );
       }
       currentJamendoTag = sanitizedTag;
       lastTrackInfo = null;
-      return msg.channel.send(`🎼 Style Jamendo défini sur **${currentJamendoTag}**. Utilise --skip-music pour passer directement sur ce style.`);
+      return sendWithAutoDelete(
+        msg.channel,
+        `🎼 Style Jamendo défini sur **${currentJamendoTag}**. Utilise --skip-music pour passer directement sur ce style.`
+      );
     }
 
     else if (cmd === '--change-volume') {
       const pct = parseFloat(arg);
-      if (isNaN(pct)) return msg.channel.send('Usage: --change-volume 80 (pour 80%)');
+      if (isNaN(pct)) {
+        return sendWithAutoDelete(msg.channel, 'Usage: --change-volume 80 (pour 80%)');
+      }
       let vol = Math.max(0, Math.min(200, pct)) / 100;
       currentVolume = vol;
       if (currentResource && currentResource.volume) currentResource.volume.setVolume(currentVolume);
-      return msg.channel.send(`🔉 Volume réglé à ${(currentVolume*100).toFixed(0)}%`);
+      return sendWithAutoDelete(
+        msg.channel,
+        `🔉 Volume réglé à ${(currentVolume*100).toFixed(0)}%`
+      );
     }
   } catch (err) {
     console.error('Commande erreur:', err);
-    try { msg.channel.send('Erreur: ' + (err.message || String(err))); } catch(e){}
+    sendWithAutoDelete(msg.channel, 'Erreur: ' + (err.message || String(err)), { suppressErrors: true });
   }
 });
 
