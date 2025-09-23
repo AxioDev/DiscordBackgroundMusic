@@ -27,7 +27,8 @@ node index.js
 
 Optional environment variables `GUILD_ID` and `VOICE_CHANNEL_ID` let the bot auto-join a voice channel on startup. You can also
 set `JAMENDO_MUSIC_TAG` to choose the default Jamendo style (defaults to `atmo`). The music tag can be changed at runtime in
-Discord with the `--change-music-tag <tag>` command.
+Discord with the `--change-music-tag <tag>` command. Playback starts at 1% volume by default; override this by exporting
+`DEFAULT_VOLUME_PERCENT` (any value between 0 and 200).
 
 ## Docker
 

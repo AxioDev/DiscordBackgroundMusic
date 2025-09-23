@@ -85,6 +85,22 @@ function parseDeleteDelay(rawValue, fallback) {
 
 const MESSAGE_DELETE_DELAY_MS = parseDeleteDelay(process.env.MESSAGE_DELETE_DELAY_MS, 1_000);
 
+function parseVolumePercent(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return null;
+  }
+  const numeric = Number(rawValue);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  const clamped = Math.max(0, Math.min(200, numeric));
+  return clamped;
+}
+
+const DEFAULT_VOLUME_PERCENT = parseVolumePercent(process.env.DEFAULT_VOLUME_PERCENT);
+const INITIAL_VOLUME_PERCENT = DEFAULT_VOLUME_PERCENT === null ? 1 : DEFAULT_VOLUME_PERCENT;
+const DEFAULT_VOLUME = INITIAL_VOLUME_PERCENT / 100;
+
 function scheduleMessageDeletion(message, delayMs = MESSAGE_DELETE_DELAY_MS) {
   if (!message || typeof message.delete !== 'function') {
     return;
@@ -140,6 +156,7 @@ if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
 
 console.log(`Tag Jamendo initial: ${currentJamendoTag}`);
 console.log(`Suppression automatique des messages après ${MESSAGE_DELETE_DELAY_MS} ms${MESSAGE_DELETE_DELAY_MS === 0 ? ' (désactivée)' : ''}.`);
+console.log(`Volume initial défini à ${INITIAL_VOLUME_PERCENT}%`);
 
 const ALLOWED_USER_ID = '216189520872210444';
 const ALLOWED_ROLE_NAMES = ['Radio', 'Modo', 'Medium'];
@@ -164,7 +181,7 @@ const client = new Client({
 let voiceConnection = null;
 const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
 let currentResource = null;
-let currentVolume = 0.01; // 1% par défaut
+let currentVolume = DEFAULT_VOLUME; // 1% par défaut (ou valeur personnalisée via env)
 let lastTrackInfo = null;
 let manualStopInProgress = false;
 let autoPlaybackDesired = false;
@@ -812,12 +829,11 @@ client.on('messageCreate', async (msg) => {
     }
 
     else if (cmd === '--change-volume') {
-      const pct = parseFloat(arg);
-      if (isNaN(pct)) {
+      const parsed = parseVolumePercent(arg);
+      if (parsed === null) {
         return sendWithAutoDelete(msg.channel, 'Usage: --change-volume 80 (pour 80%)');
       }
-      let vol = Math.max(0, Math.min(200, pct)) / 100;
-      currentVolume = vol;
+      currentVolume = parsed / 100;
       if (currentResource && currentResource.volume) currentResource.volume.setVolume(currentVolume);
       return sendWithAutoDelete(
         msg.channel,
