@@ -30,6 +30,8 @@ set `JAMENDO_MUSIC_TAG` to choose the default Jamendo style (defaults to `atmo`)
 Discord with the `--change-music-tag <tag>` command. Playback starts at 1% volume by default; override this by exporting
 `DEFAULT_VOLUME_PERCENT` (any value between 0 and 200).
 
+Use `--start-music <url>` to stream a custom audio source. The bot understands direct audio links as well as YouTube URLs.
+
 ## Docker
 
 A Dockerfile and docker-compose.yml are included. Build and run with:

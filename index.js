@@ -66,6 +66,7 @@ const {
   entersState
 } = require('@discordjs/voice');
 const fetch = require('node-fetch'); // node 18+ peut utiliser global fetch
+const ytdl = require('ytdl-core');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const JAMENDO_CLIENT_ID = process.env.JAMENDO_CLIENT_ID;
 const AUTO_GUILD_ID = process.env.GUILD_ID || null;
@@ -178,7 +179,7 @@ function buildCommandsBioText(definitions) {
 const COMMAND_DEFINITIONS = [
   { name: '--help', description: 'Affiche cette aide.' },
   { name: '--join-vocal', description: 'Fait rejoindre ton salon vocal et démarre la musique.' },
-  { name: '--start-music', description: 'Lance la musique (ou une URL audio fournie).' },
+  { name: '--start-music', description: 'Lance la musique (ou une URL audio/YouTube fournie).' },
   { name: '--skip-music', description: 'Passe à la piste Jamendo suivante.' },
   { name: '--stop-music', description: 'Arrête la musique et quitte le vocal.' },
   { name: '--change-music-tag', description: 'Change le style Jamendo utilisé pour la lecture.' },
@@ -420,6 +421,84 @@ async function fetchAudioStream(url, label = 'source distante') {
   return response.body;
 }
 
+const YOUTUBE_HOST_SUFFIXES = ['youtube.com', 'youtu.be', 'youtube-nocookie.com'];
+
+function isYoutubeUrl(input) {
+  if (typeof input !== 'string') return false;
+  let parsed;
+  try {
+    parsed = new URL(input.trim());
+  } catch (err) {
+    return false;
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  return YOUTUBE_HOST_SUFFIXES.some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`));
+}
+
+async function getYoutubeAudioStream(url) {
+  let info;
+  try {
+    info = await ytdl.getInfo(url);
+  } catch (err) {
+    const detail = err?.message || err;
+    throw new Error(`Impossible de récupérer les informations YouTube (${detail})`);
+  }
+
+  let stream;
+  try {
+    stream = ytdl.downloadFromInfo(info, {
+      filter: 'audioonly',
+      quality: 'highestaudio',
+      highWaterMark: 1 << 25,
+      dlChunkSize: 0
+    });
+  } catch (err) {
+    const detail = err?.message || err;
+    throw new Error(`Impossible de lancer le flux audio YouTube (${detail})`);
+  }
+
+  const details = info?.videoDetails || {};
+  const author = details.author || {};
+  const licenseUrl =
+    (typeof details.ownerProfileUrl === 'string' && details.ownerProfileUrl) ||
+    (typeof author.channel_url === 'string' && author.channel_url) ||
+    null;
+
+  return {
+    stream,
+    info: {
+      name: details.title || 'Vidéo YouTube',
+      artist: author.name || 'YouTube',
+      audioUrl: url,
+      licenseUrl,
+      tag: null
+    }
+  };
+}
+
+async function getCustomAudioStream(url) {
+  const trimmed = typeof url === 'string' ? url.trim() : '';
+  if (!trimmed) {
+    throw new Error('URL fournie invalide.');
+  }
+
+  if (isYoutubeUrl(trimmed)) {
+    return getYoutubeAudioStream(trimmed);
+  }
+
+  const stream = await fetchAudioStream(trimmed, 'la source fournie');
+  return {
+    stream,
+    info: {
+      name: 'Source fournie',
+      artist: trimmed,
+      audioUrl: trimmed,
+      licenseUrl: null,
+      tag: null
+    }
+  };
+}
+
 function isVoiceChannel(channel) {
   if (!channel) return false;
   return channel.type === 2 || channel.type === 'GUILD_VOICE' || channel.type === 'GUILD_STAGE_VOICE';
@@ -556,14 +635,9 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
     let trackInfo = null;
 
     if (customUrl) {
-      remoteStream = await fetchAudioStream(customUrl, 'la source fournie');
-      trackInfo = {
-        name: 'Source fournie',
-        artist: customUrl,
-        audioUrl: customUrl,
-        licenseUrl: null,
-        tag: null
-      };
+      const custom = await getCustomAudioStream(customUrl);
+      remoteStream = custom.stream;
+      trackInfo = custom.info;
     } else {
       const jamendoData = await getJamendoTrackStream();
       remoteStream = jamendoData.stream;
@@ -614,11 +688,11 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
     const volumeInfo = `(volume ${(currentVolume * 100).toFixed(0)}%)`;
     if (effectiveAnnounceChannel && typeof effectiveAnnounceChannel.send === 'function') {
       let message;
-      if (!customUrl && trackInfo) {
+      if (trackInfo) {
+        const namePart = trackInfo.name ? `**${trackInfo.name}**` : 'Une source audio';
+        const artistPart = trackInfo.artist ? ` — ${trackInfo.artist}` : '';
         const licensePart = trackInfo.licenseUrl ? ` (licence: ${trackInfo.licenseUrl})` : '';
-        message = `▶️ ${prefix} : **${trackInfo.name}** — ${trackInfo.artist}${licensePart} ${volumeInfo}`;
-      } else if (customUrl) {
-        message = `▶️ ${prefix} depuis la source fournie ${volumeInfo}`;
+        message = `▶️ ${prefix} : ${namePart}${artistPart}${licensePart} ${volumeInfo}`;
       } else {
         message = `▶️ ${prefix} ${volumeInfo}`;
       }
