@@ -435,11 +435,34 @@ function isYoutubeUrl(input) {
   return YOUTUBE_HOST_SUFFIXES.some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`));
 }
 
-const YOUTUBE_REQUEST_HEADERS = Object.freeze({
+function normalizeYoutubeConsentCookie(rawValue) {
+  if (typeof rawValue !== 'string') {
+    return null;
+  }
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return trimmed;
+}
+
+const DEFAULT_YOUTUBE_CONSENT_COOKIE = 'SOCS=CAI';
+const YOUTUBE_CONSENT_COOKIE =
+  normalizeYoutubeConsentCookie(process.env.YOUTUBE_CONSENT_COOKIE) || DEFAULT_YOUTUBE_CONSENT_COOKIE;
+
+const youtubeRequestHeaders = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept-Language': 'en-US,en;q=0.9'
-});
+  'Accept-Language': 'en-US,en;q=0.9',
+  Accept: '*/*',
+  Referer: 'https://www.youtube.com'
+};
+
+if (YOUTUBE_CONSENT_COOKIE) {
+  youtubeRequestHeaders.Cookie = YOUTUBE_CONSENT_COOKIE;
+}
+
+const YOUTUBE_REQUEST_HEADERS = Object.freeze(youtubeRequestHeaders);
 
 async function getYoutubeAudioStream(url) {
   let info;
