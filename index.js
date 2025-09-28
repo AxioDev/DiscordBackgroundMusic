@@ -84,7 +84,7 @@ function parseDeleteDelay(rawValue, fallback) {
   return normalized;
 }
 
-const MESSAGE_DELETE_DELAY_MS = parseDeleteDelay(process.env.MESSAGE_DELETE_DELAY_MS, 1_000);
+const MESSAGE_DELETE_DELAY_MS = parseDeleteDelay(process.env.MESSAGE_DELETE_DELAY_MS, 15_000);
 
 function parseVolumePercent(rawValue) {
   if (rawValue === undefined || rawValue === null || rawValue === '') {
