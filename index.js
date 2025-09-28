@@ -66,7 +66,7 @@ const {
   entersState
 } = require('@discordjs/voice');
 const fetch = require('node-fetch'); // node 18+ peut utiliser global fetch
-const playdl = require('play-dl');
+const youtubedl = require('youtube-dl-exec');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const JAMENDO_CLIENT_ID = process.env.JAMENDO_CLIENT_ID;
 const AUTO_GUILD_ID = process.env.GUILD_ID || null;
@@ -534,13 +534,25 @@ async function getJamendoTrackStream(tag = currentJamendoTag) {
   throw new Error('Aucune piste Jamendo lisible trouvée.');
 }
 
-async function fetchAudioStream(url, label = 'source distante') {
+async function fetchAudioStream(url, label = 'source distante', options = {}) {
+  const { headers: extraHeaders = {} } = options || {};
+  const headers = {
+    'User-Agent': 'DiscordBackgroundMusicBot/1.0 (+https://github.com/DiscordBackgroundMusic/DiscordBackgroundMusic)',
+    Accept: 'audio/*;q=0.9,*/*;q=0.5'
+  };
+
+  if (extraHeaders && typeof extraHeaders === 'object') {
+    for (const [key, value] of Object.entries(extraHeaders)) {
+      if (value === undefined || value === null) {
+        continue;
+      }
+      headers[key] = String(value);
+    }
+  }
+
   const response = await fetch(url, {
     redirect: 'follow',
-    headers: {
-      'User-Agent': 'DiscordBackgroundMusicBot/1.0 (+https://github.com/DiscordBackgroundMusic/DiscordBackgroundMusic)',
-      Accept: 'audio/*;q=0.9,*/*;q=0.5'
-    }
+    headers
   });
   if (!response.ok || !response.body) {
     const statusText = (response.statusText || '').trim();
@@ -577,83 +589,157 @@ function normalizeYoutubeConsentCookie(rawValue) {
 
 const YOUTUBE_CONSENT_COOKIE = normalizeYoutubeConsentCookie(process.env.YOUTUBE_CONSENT_COOKIE);
 
-function normalizePlayDlStreamType(playDlType) {
-  const playStreamType = playdl?.StreamType;
-  if (playStreamType) {
-    if (playDlType === playStreamType.Opus) {
-      return StreamType.Opus;
+function normalizeYoutubeDlHeaders(rawHeaders) {
+  if (!rawHeaders || typeof rawHeaders !== 'object') {
+    return null;
+  }
+  const normalized = {};
+  for (const [key, value] of Object.entries(rawHeaders)) {
+    if (value === undefined || value === null) {
+      continue;
     }
-    if (playDlType === playStreamType.Raw) {
-      return StreamType.Raw;
-    }
-    if (playDlType === playStreamType.Arbitrary) {
-      return StreamType.Arbitrary;
-    }
+    normalized[key] = String(value);
   }
-
-  if (playDlType === 'opus') {
-    return StreamType.Opus;
-  }
-  if (playDlType === 'raw') {
-    return StreamType.Raw;
-  }
-  if (playDlType === 'arbitrary') {
-    return StreamType.Arbitrary;
-  }
-
-  return StreamType.Arbitrary;
+  return Object.keys(normalized).length > 0 ? normalized : null;
 }
 
-if (YOUTUBE_CONSENT_COOKIE) {
-  try {
-    playdl.setToken({
-      youtube: {
-        cookie: YOUTUBE_CONSENT_COOKIE
+function extractYoutubeAudio(details) {
+  if (!details || typeof details !== 'object') {
+    return null;
+  }
+
+  const fallbackHeaders = normalizeYoutubeDlHeaders(details.http_headers);
+
+  const tryFormat = (format) => {
+    if (!format || typeof format !== 'object') {
+      return null;
+    }
+    const acodec = format.acodec;
+    if (!acodec || acodec === 'none') {
+      return null;
+    }
+    const headers = normalizeYoutubeDlHeaders(format.http_headers) || fallbackHeaders;
+    if (typeof format.url === 'string' && format.url) {
+      return {
+        url: format.url,
+        headers
+      };
+    }
+    if (typeof format.manifest_url === 'string' && format.manifest_url) {
+      return {
+        url: format.manifest_url,
+        headers
+      };
+    }
+    return null;
+  };
+
+  if (typeof details.url === 'string' && details.url) {
+    return {
+      url: details.url,
+      headers: fallbackHeaders
+    };
+  }
+
+  const collections = [];
+  if (Array.isArray(details.requested_formats)) {
+    collections.push(details.requested_formats);
+  }
+  if (Array.isArray(details.formats)) {
+    collections.push(details.formats);
+  }
+
+  for (const group of collections) {
+    for (const format of group) {
+      const candidate = tryFormat(format);
+      if (candidate) {
+        return candidate;
       }
-    });
-    console.log('Cookie de consentement YouTube appliqué pour play-dl.');
+    }
+  }
+
+  return null;
+}
+
+function parseYoutubeDlOutput(output) {
+  if (output && typeof output === 'object' && !Buffer.isBuffer(output)) {
+    return output;
+  }
+
+  const text = Buffer.isBuffer(output) ? output.toString('utf8') : String(output || '');
+  try {
+    return JSON.parse(text);
   } catch (err) {
-    console.warn(
-      'Impossible d\'appliquer le cookie de consentement YouTube pour play-dl:',
-      err?.message || err
-    );
+    throw new Error('Réponse inattendue renvoyée par yt-dlp.');
   }
 }
 
 async function getYoutubeAudioStream(url) {
-  let info;
+  const addHeader = [];
+  if (YOUTUBE_CONSENT_COOKIE) {
+    addHeader.push(`Cookie: ${YOUTUBE_CONSENT_COOKIE}`);
+  }
+
+  const ytDlpOptions = {
+    dumpSingleJson: true,
+    skipDownload: true,
+    noCheckCertificates: true,
+    noWarnings: true,
+    preferFreeFormats: true,
+    format: 'bestaudio/best',
+    noPlaylist: true
+  };
+
+  if (addHeader.length > 0) {
+    ytDlpOptions.addHeader = addHeader;
+  }
+
+  let rawInfo;
   try {
-    info = await playdl.video_info(url);
+    rawInfo = await youtubedl(url, ytDlpOptions);
   } catch (err) {
     const detail = err?.message || err;
     throw new Error(`Impossible de récupérer les informations YouTube (${detail})`);
   }
 
-  let streamData;
+  let info;
   try {
-    streamData = await playdl.stream_from_info(info, { discordPlayerCompatibility: true });
+    info = parseYoutubeDlOutput(rawInfo);
   } catch (err) {
-    const detail = err?.message || err;
-    throw new Error(`Impossible de lancer le flux audio YouTube (${detail})`);
+    throw new Error(err.message || 'Réponse YouTube invalide.');
   }
 
-  const details = info?.video_details || {};
-  const channel = details?.channel || {};
+  const streamDetails = extractYoutubeAudio(info);
+  if (!streamDetails || !streamDetails.url) {
+    throw new Error('Impossible de déterminer l\'URL audio YouTube.');
+  }
+
+  const headers = streamDetails.headers ? { ...streamDetails.headers } : {};
+  if (YOUTUBE_CONSENT_COOKIE && !headers?.Cookie) {
+    headers.Cookie = YOUTUBE_CONSENT_COOKIE;
+  }
+
+  const stream = await fetchAudioStream(
+    streamDetails.url,
+    `l'audio YouTube pour ${info?.title || 'une vidéo'}`,
+    { headers }
+  );
+
   const licenseUrl =
-    (typeof channel.url === 'string' && channel.url) ||
-    (typeof details?.channel_url === 'string' && details.channel_url) ||
+    (typeof info?.channel_url === 'string' && info.channel_url) ||
+    (typeof info?.uploader_url === 'string' && info.uploader_url) ||
     null;
   const artistName =
-    (typeof channel.name === 'string' && channel.name) ||
-    (typeof channel.username === 'string' && channel.username) ||
-    (typeof details?.author?.name === 'string' && details.author.name) ||
+    (typeof info?.uploader === 'string' && info.uploader) ||
+    (typeof info?.channel === 'string' && info.channel) ||
+    (typeof info?.artist === 'string' && info.artist) ||
     'YouTube';
 
   return {
-    stream: streamData.stream,
-    inputType: normalizePlayDlStreamType(streamData.type),
+    stream,
+    inputType: StreamType.Arbitrary,
     info: {
-      name: details?.title || 'Vidéo YouTube',
+      name: info?.title || 'Vidéo YouTube',
       artist: artistName,
       audioUrl: url,
       licenseUrl,
