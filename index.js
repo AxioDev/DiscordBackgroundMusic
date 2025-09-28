@@ -574,11 +574,9 @@ function normalizeYoutubeConsentCookie(rawValue) {
   return trimmed;
 }
 
-const DEFAULT_YOUTUBE_CONSENT_COOKIE = 'SOCS=CAI';
-const YOUTUBE_CONSENT_COOKIE =
-  normalizeYoutubeConsentCookie(process.env.YOUTUBE_CONSENT_COOKIE) || DEFAULT_YOUTUBE_CONSENT_COOKIE;
+const YOUTUBE_CONSENT_COOKIE = normalizeYoutubeConsentCookie(process.env.YOUTUBE_CONSENT_COOKIE);
 
-const youtubeRequestHeaders = {
+const youtubeBaseRequestHeaders = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept-Language': 'en-US,en;q=0.9',
@@ -586,20 +584,54 @@ const youtubeRequestHeaders = {
   Referer: 'https://www.youtube.com'
 };
 
-if (YOUTUBE_CONSENT_COOKIE) {
-  youtubeRequestHeaders.Cookie = YOUTUBE_CONSENT_COOKIE;
+const YOUTUBE_REQUEST_HEADERS_WITH_COOKIE = YOUTUBE_CONSENT_COOKIE
+  ? Object.freeze({ ...youtubeBaseRequestHeaders, Cookie: YOUTUBE_CONSENT_COOKIE })
+  : null;
+
+const YOUTUBE_REQUEST_HEADERS_NO_COOKIE = Object.freeze({ ...youtubeBaseRequestHeaders });
+
+function isYoutubeIdentityTokenError(err) {
+  const message = err?.message;
+  if (typeof message !== 'string') {
+    return false;
+  }
+  return message.toLowerCase().includes('identity token');
 }
 
-const YOUTUBE_REQUEST_HEADERS = Object.freeze(youtubeRequestHeaders);
+async function loadYoutubeInfo(url, headers) {
+  return ytdl.getInfo(url, {
+    requestOptions: {
+      headers
+    }
+  });
+}
+
+async function getYoutubeInfoAndHeaders(url) {
+  if (YOUTUBE_REQUEST_HEADERS_WITH_COOKIE) {
+    try {
+      const info = await loadYoutubeInfo(url, YOUTUBE_REQUEST_HEADERS_WITH_COOKIE);
+      return { info, headers: YOUTUBE_REQUEST_HEADERS_WITH_COOKIE };
+    } catch (err) {
+      if (!isYoutubeIdentityTokenError(err)) {
+        throw err;
+      }
+      console.warn(
+        'Impossible de récupérer les informations YouTube avec le cookie fourni (jeton d\'identité manquant). Nouvel essai sans Cookie.'
+      );
+    }
+  }
+
+  const info = await loadYoutubeInfo(url, YOUTUBE_REQUEST_HEADERS_NO_COOKIE);
+  return { info, headers: YOUTUBE_REQUEST_HEADERS_NO_COOKIE };
+}
 
 async function getYoutubeAudioStream(url) {
   let info;
+  let requestHeaders;
   try {
-    info = await ytdl.getInfo(url, {
-      requestOptions: {
-        headers: YOUTUBE_REQUEST_HEADERS
-      }
-    });
+    const result = await getYoutubeInfoAndHeaders(url);
+    info = result.info;
+    requestHeaders = result.headers;
   } catch (err) {
     const detail = err?.message || err;
     throw new Error(`Impossible de récupérer les informations YouTube (${detail})`);
@@ -613,7 +645,7 @@ async function getYoutubeAudioStream(url) {
       highWaterMark: 1 << 25,
       dlChunkSize: 0,
       requestOptions: {
-        headers: YOUTUBE_REQUEST_HEADERS
+        headers: requestHeaders
       }
     });
   } catch (err) {
