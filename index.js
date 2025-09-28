@@ -99,7 +99,13 @@ function parseVolumePercent(rawValue) {
 }
 
 const DEFAULT_VOLUME_PERCENT = parseVolumePercent(process.env.DEFAULT_VOLUME_PERCENT);
-const INITIAL_VOLUME_PERCENT = DEFAULT_VOLUME_PERCENT === null ? 1 : DEFAULT_VOLUME_PERCENT;
+const MIN_AUTO_VOLUME_PERCENT = 1;
+const MAX_AUTO_VOLUME_PERCENT = 10;
+const AUTO_VOLUME_MAX_MEMBERS = 25;
+
+const INITIAL_VOLUME_PERCENT = DEFAULT_VOLUME_PERCENT === null
+  ? MAX_AUTO_VOLUME_PERCENT
+  : clampAutoVolumePercent(DEFAULT_VOLUME_PERCENT);
 const DEFAULT_VOLUME = INITIAL_VOLUME_PERCENT / 100;
 
 function scheduleMessageDeletion(message, delayMs = MESSAGE_DELETE_DELAY_MS) {
@@ -140,6 +146,72 @@ function sendWithAutoDelete(target, content, options = {}) {
     });
 }
 
+function clampAutoVolumePercent(percent) {
+  if (!Number.isFinite(percent)) {
+    return MAX_AUTO_VOLUME_PERCENT;
+  }
+  return Math.max(MIN_AUTO_VOLUME_PERCENT, Math.min(MAX_AUTO_VOLUME_PERCENT, percent));
+}
+
+function countRelevantVoiceMembers(channel) {
+  if (!channel || !channel.members || typeof channel.members.values !== 'function') {
+    return 0;
+  }
+  let count = 0;
+  for (const member of channel.members.values()) {
+    if (!member) continue;
+    const user = member.user;
+    if (user && user.bot && client?.user && member.id !== client.user.id) {
+      continue;
+    }
+    count++;
+  }
+  return count;
+}
+
+function computeAutoVolumePercent(memberCount) {
+  if (!Number.isFinite(memberCount) || memberCount <= 1) {
+    return MAX_AUTO_VOLUME_PERCENT;
+  }
+  const clampedCount = Math.max(1, Math.min(AUTO_VOLUME_MAX_MEMBERS, memberCount));
+  if (AUTO_VOLUME_MAX_MEMBERS <= 1) {
+    return MAX_AUTO_VOLUME_PERCENT;
+  }
+  const ratio = (clampedCount - 1) / (AUTO_VOLUME_MAX_MEMBERS - 1);
+  const percent = MAX_AUTO_VOLUME_PERCENT - ratio * (MAX_AUTO_VOLUME_PERCENT - MIN_AUTO_VOLUME_PERCENT);
+  return clampAutoVolumePercent(percent);
+}
+
+function applyVolumePercent(percent, { cause = 'auto' } = {}) {
+  const normalizedPercent = Number.isFinite(percent) ? Math.max(0, Math.min(200, percent)) : MAX_AUTO_VOLUME_PERCENT;
+  const previousVolume = currentVolume;
+  const normalizedVolume = normalizedPercent / 100;
+  currentVolume = normalizedVolume;
+  if (currentResource && currentResource.volume && typeof currentResource.volume.setVolume === 'function') {
+    try {
+      currentResource.volume.setVolume(currentVolume);
+    } catch (err) {
+      console.warn('Impossible de mettre à jour le volume de la ressource audio:', err?.message || err);
+    }
+  }
+  if (!Number.isFinite(previousVolume) || Math.abs(previousVolume - currentVolume) >= 0.0001) {
+    console.log(`Volume ${cause}: ${(currentVolume * 100).toFixed(2)}%`);
+  }
+  return normalizedPercent;
+}
+
+function updateAutomaticVolumeForChannel(channel, { cause = 'auto' } = {}) {
+  if (!channel || !isVoiceChannel(channel)) {
+    return null;
+  }
+
+  currentVoiceChannel = channel;
+  const memberCount = countRelevantVoiceMembers(channel);
+  const targetPercent = computeAutoVolumePercent(memberCount);
+  const appliedPercent = applyVolumePercent(targetPercent, { cause: `${cause} (${memberCount} membres)` });
+  return { memberCount, percent: appliedPercent };
+}
+
 function sanitizeMusicTag(rawTag) {
   if (typeof rawTag !== 'string') return null;
   const trimmed = rawTag.trim();
@@ -157,7 +229,9 @@ if (!BOT_TOKEN || !JAMENDO_CLIENT_ID) {
 
 console.log(`Tag Jamendo initial: ${currentJamendoTag}`);
 console.log(`Suppression automatique des messages après ${MESSAGE_DELETE_DELAY_MS} ms${MESSAGE_DELETE_DELAY_MS === 0 ? ' (désactivée)' : ''}.`);
-console.log(`Volume initial défini à ${INITIAL_VOLUME_PERCENT}%`);
+console.log(
+  `Volume automatique initial: ${INITIAL_VOLUME_PERCENT}% (ajustement entre ${MIN_AUTO_VOLUME_PERCENT}% et ${MAX_AUTO_VOLUME_PERCENT}% jusqu'à ${AUTO_VOLUME_MAX_MEMBERS} personnes).`
+);
 
 const ALLOWED_USER_ID = '216189520872210444';
 const ALLOWED_ROLE_NAMES = ['Radio', 'Modo', 'Medium'];
@@ -183,7 +257,7 @@ const COMMAND_DEFINITIONS = [
   { name: '--skip-music', description: 'Passe à la piste Jamendo suivante.' },
   { name: '--stop-music', description: 'Arrête la musique et quitte le vocal.' },
   { name: '--change-music-tag', description: 'Change le style Jamendo utilisé pour la lecture.' },
-  { name: '--change-volume', description: 'Ajuste le volume du flux audio.' }
+  { name: '--change-volume', description: 'Indique le volume actuel (ajustement automatique).' }
 ];
 
 const COMMANDS_HELP_MESSAGE = buildCommandsHelpMessage(COMMAND_DEFINITIONS);
@@ -207,9 +281,10 @@ const client = new Client({
 });
 
 let voiceConnection = null;
+let currentVoiceChannel = null;
 const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
 let currentResource = null;
-let currentVolume = DEFAULT_VOLUME; // 1% par défaut (ou valeur personnalisée via env)
+let currentVolume = DEFAULT_VOLUME; // Valeur initiale, ajustée automatiquement ensuite
 let lastTrackInfo = null;
 let manualStopInProgress = false;
 let autoPlaybackDesired = false;
@@ -318,6 +393,59 @@ client.once('ready', async () => {
     }
   }
 });
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+  try {
+    const trackedChannelId = currentVoiceChannel?.id || voiceConnection?.joinConfig?.channelId || lastVoiceChannelId;
+    if (!trackedChannelId) {
+      return;
+    }
+
+    const oldChannelId = oldState?.channelId || null;
+    const newChannelId = newState?.channelId || null;
+
+    if (oldChannelId !== trackedChannelId && newChannelId !== trackedChannelId) {
+      return;
+    }
+
+    const candidateChannel =
+      (newChannelId === trackedChannelId ? newState?.channel : null) ||
+      (oldChannelId === trackedChannelId ? oldState?.channel : null) ||
+      currentVoiceChannel;
+
+    if (candidateChannel && isVoiceChannel(candidateChannel)) {
+      updateAutomaticVolumeForChannel(candidateChannel, { cause: 'mise à jour vocale' });
+      return;
+    }
+
+    const guild = newState?.guild || oldState?.guild;
+    if (!guild || typeof guild.channels?.fetch !== 'function') {
+      return;
+    }
+
+    guild.channels
+      .fetch(trackedChannelId)
+      .then((channel) => {
+        if (isVoiceChannel(channel)) {
+          updateAutomaticVolumeForChannel(channel, { cause: 'mise à jour vocale (fetch)' });
+        }
+      })
+      .catch(() => {});
+  } catch (err) {
+    console.warn('Mise à jour automatique du volume impossible:', err?.message || err);
+  }
+});
+
+setInterval(() => {
+  try {
+    if (!currentVoiceChannel || !isVoiceChannel(currentVoiceChannel)) {
+      return;
+    }
+    updateAutomaticVolumeForChannel(currentVoiceChannel, { cause: 'rafraîchissement périodique' });
+  } catch (err) {
+    console.warn('Rafraîchissement automatique du volume impossible:', err?.message || err);
+  }
+}, 15_000);
 
 // Recherche une piste sur Jamendo en fonction du tag actuel en privilégiant celles dont le téléchargement est autorisé
 async function getJamendoTrackStream(tag = currentJamendoTag) {
@@ -571,13 +699,17 @@ async function connectToVoiceChannel(channel, { autoStartPlayback: shouldAutoSta
   });
 
   voiceConnection = connection;
+  currentVoiceChannel = channel;
   try {
     await waitForVoiceConnectionReady(connection);
     lastVoiceChannelId = channel.id;
   } catch (err) {
     voiceConnection = null;
+    currentVoiceChannel = null;
     throw err;
   }
+
+  updateAutomaticVolumeForChannel(channel, { cause: 'connexion vocale' });
 
   autoPlaybackDesired = shouldAutoStart;
   if (shouldAutoStart) {
@@ -600,6 +732,7 @@ async function ensureVoiceConnection({ msg = null, autoPlayOnJoin = true, announ
       console.warn('Connexion vocale invalide, tentative de reconnexion:', err?.message || err);
       try { voiceConnection.destroy(); } catch (destroyErr) { console.error('Destruction connexion vocale échouée:', destroyErr); }
       voiceConnection = null;
+      currentVoiceChannel = null;
     }
   }
 
@@ -960,6 +1093,7 @@ client.on('messageCreate', async (msg) => {
       if (voiceConnection) {
         try { voiceConnection.destroy(); } catch(e){}
         voiceConnection = null;
+        currentVoiceChannel = null;
       }
       currentResource = null;
       lastTrackInfo = null;
@@ -993,16 +1127,29 @@ client.on('messageCreate', async (msg) => {
     }
 
     else if (cmd === '--change-volume') {
-      const parsed = parseVolumePercent(arg);
-      if (parsed === null) {
-        return sendWithAutoDelete(msg.channel, 'Usage: --change-volume 80 (pour 80%)');
+      const extraArgs = parts.slice(1);
+      const voiceChannel = currentVoiceChannel;
+      const memberCount = voiceChannel ? countRelevantVoiceMembers(voiceChannel) : null;
+      let participantsText = '';
+      if (memberCount !== null) {
+        if (memberCount === 0) {
+          participantsText = ', basé sur aucune personne connectée';
+        } else {
+          const plural = memberCount > 1 ? 's' : '';
+          participantsText = `, basé sur ${memberCount} personne${plural} connectée${plural}`;
+        }
       }
-      currentVolume = parsed / 100;
-      if (currentResource && currentResource.volume) currentResource.volume.setVolume(currentVolume);
-      return sendWithAutoDelete(
-        msg.channel,
-        `🔉 Volume réglé à ${(currentVolume*100).toFixed(0)}%`
+      const lines = [];
+      if (extraArgs.length > 0) {
+        lines.push('⚠️ Le volume est désormais géré automatiquement ; la valeur fournie est ignorée.');
+      }
+      lines.push(
+        `🔉 Volume automatique actuel: ${(currentVolume * 100).toFixed(1)}%${participantsText}.`
       );
+      lines.push(
+        `ℹ️ Le volume s'ajuste entre ${MIN_AUTO_VOLUME_PERCENT}% et ${MAX_AUTO_VOLUME_PERCENT}% (jusqu'à ${AUTO_VOLUME_MAX_MEMBERS} personnes).`
+      );
+      return sendWithAutoDelete(msg.channel, lines.join('\n'));
     }
   } catch (err) {
     console.error('Commande erreur:', err);
