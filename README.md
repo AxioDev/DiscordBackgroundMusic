@@ -31,9 +31,7 @@ Discord with the `--change-music-tag <tag>` command. Playback starts at 1% volum
 `DEFAULT_VOLUME_PERCENT` (any value between 0 and 200).
 
 Use `--start-music <url>` to stream a custom audio source. The bot understands direct audio links as well as YouTube URLs.
-When streaming YouTube, the bot now sends a consent cookie by default so that regions requiring GDPR consent do not return HTTP
-410 errors. Override the cookie value with `YOUTUBE_CONSENT_COOKIE` if you need a different one or want to provide a full `CONSENT`
-string from your own browser session.
+When streaming YouTube, you can provide a consent cookie via the `YOUTUBE_CONSENT_COOKIE` environment variable if your region requires one to bypass GDPR-related HTTP 410 errors. The bot automatically retries requests without the cookie when YouTube rejects it for missing identity tokens, which prevents the "Cookie header used in request, but unable to find YouTube identity token" error introduced by recent YouTube changes.
 
 ## Docker
 
