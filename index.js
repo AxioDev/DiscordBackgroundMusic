@@ -435,10 +435,20 @@ function isYoutubeUrl(input) {
   return YOUTUBE_HOST_SUFFIXES.some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`));
 }
 
+const YOUTUBE_REQUEST_HEADERS = Object.freeze({
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9'
+});
+
 async function getYoutubeAudioStream(url) {
   let info;
   try {
-    info = await ytdl.getInfo(url);
+    info = await ytdl.getInfo(url, {
+      requestOptions: {
+        headers: YOUTUBE_REQUEST_HEADERS
+      }
+    });
   } catch (err) {
     const detail = err?.message || err;
     throw new Error(`Impossible de récupérer les informations YouTube (${detail})`);
@@ -450,7 +460,10 @@ async function getYoutubeAudioStream(url) {
       filter: 'audioonly',
       quality: 'highestaudio',
       highWaterMark: 1 << 25,
-      dlChunkSize: 0
+      dlChunkSize: 0,
+      requestOptions: {
+        headers: YOUTUBE_REQUEST_HEADERS
+      }
     });
   } catch (err) {
     const detail = err?.message || err;
