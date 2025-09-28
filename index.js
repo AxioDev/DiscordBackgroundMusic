@@ -66,7 +66,7 @@ const {
   entersState
 } = require('@discordjs/voice');
 const fetch = require('node-fetch'); // node 18+ peut utiliser global fetch
-const ytdl = require('ytdl-core');
+const playdl = require('play-dl');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const JAMENDO_CLIENT_ID = process.env.JAMENDO_CLIENT_ID;
 const AUTO_GUILD_ID = process.env.GUILD_ID || null;
@@ -513,6 +513,7 @@ async function getJamendoTrackStream(tag = currentJamendoTag) {
       const licenseUrl = track.license_ccurl || track.license || null;
       return {
         stream,
+        inputType: StreamType.Arbitrary,
         info: {
           audioUrl,
           name: track.name || 'Piste Jamendo',
@@ -576,95 +577,84 @@ function normalizeYoutubeConsentCookie(rawValue) {
 
 const YOUTUBE_CONSENT_COOKIE = normalizeYoutubeConsentCookie(process.env.YOUTUBE_CONSENT_COOKIE);
 
-const youtubeBaseRequestHeaders = {
-  'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept-Language': 'en-US,en;q=0.9',
-  Accept: '*/*',
-  Referer: 'https://www.youtube.com'
-};
-
-const YOUTUBE_REQUEST_HEADERS_WITH_COOKIE = YOUTUBE_CONSENT_COOKIE
-  ? Object.freeze({ ...youtubeBaseRequestHeaders, Cookie: YOUTUBE_CONSENT_COOKIE })
-  : null;
-
-const YOUTUBE_REQUEST_HEADERS_NO_COOKIE = Object.freeze({ ...youtubeBaseRequestHeaders });
-
-function isYoutubeIdentityTokenError(err) {
-  const message = err?.message;
-  if (typeof message !== 'string') {
-    return false;
-  }
-  return message.toLowerCase().includes('identity token');
-}
-
-async function loadYoutubeInfo(url, headers) {
-  return ytdl.getInfo(url, {
-    requestOptions: {
-      headers
+function normalizePlayDlStreamType(playDlType) {
+  const playStreamType = playdl?.StreamType;
+  if (playStreamType) {
+    if (playDlType === playStreamType.Opus) {
+      return StreamType.Opus;
     }
-  });
+    if (playDlType === playStreamType.Raw) {
+      return StreamType.Raw;
+    }
+    if (playDlType === playStreamType.Arbitrary) {
+      return StreamType.Arbitrary;
+    }
+  }
+
+  if (playDlType === 'opus') {
+    return StreamType.Opus;
+  }
+  if (playDlType === 'raw') {
+    return StreamType.Raw;
+  }
+  if (playDlType === 'arbitrary') {
+    return StreamType.Arbitrary;
+  }
+
+  return StreamType.Arbitrary;
 }
 
-async function getYoutubeInfoAndHeaders(url) {
-  if (YOUTUBE_REQUEST_HEADERS_WITH_COOKIE) {
-    try {
-      const info = await loadYoutubeInfo(url, YOUTUBE_REQUEST_HEADERS_WITH_COOKIE);
-      return { info, headers: YOUTUBE_REQUEST_HEADERS_WITH_COOKIE };
-    } catch (err) {
-      if (!isYoutubeIdentityTokenError(err)) {
-        throw err;
+if (YOUTUBE_CONSENT_COOKIE) {
+  try {
+    playdl.setToken({
+      youtube: {
+        cookie: YOUTUBE_CONSENT_COOKIE
       }
-      console.warn(
-        'Impossible de récupérer les informations YouTube avec le cookie fourni (jeton d\'identité manquant). Nouvel essai sans Cookie.'
-      );
-    }
+    });
+    console.log('Cookie de consentement YouTube appliqué pour play-dl.');
+  } catch (err) {
+    console.warn(
+      'Impossible d\'appliquer le cookie de consentement YouTube pour play-dl:',
+      err?.message || err
+    );
   }
-
-  const info = await loadYoutubeInfo(url, YOUTUBE_REQUEST_HEADERS_NO_COOKIE);
-  return { info, headers: YOUTUBE_REQUEST_HEADERS_NO_COOKIE };
 }
 
 async function getYoutubeAudioStream(url) {
   let info;
-  let requestHeaders;
   try {
-    const result = await getYoutubeInfoAndHeaders(url);
-    info = result.info;
-    requestHeaders = result.headers;
+    info = await playdl.video_info(url);
   } catch (err) {
     const detail = err?.message || err;
     throw new Error(`Impossible de récupérer les informations YouTube (${detail})`);
   }
 
-  let stream;
+  let streamData;
   try {
-    stream = ytdl.downloadFromInfo(info, {
-      filter: 'audioonly',
-      quality: 'highestaudio',
-      highWaterMark: 1 << 25,
-      dlChunkSize: 0,
-      requestOptions: {
-        headers: requestHeaders
-      }
-    });
+    streamData = await playdl.stream_from_info(info, { discordPlayerCompatibility: true });
   } catch (err) {
     const detail = err?.message || err;
     throw new Error(`Impossible de lancer le flux audio YouTube (${detail})`);
   }
 
-  const details = info?.videoDetails || {};
-  const author = details.author || {};
+  const details = info?.video_details || {};
+  const channel = details?.channel || {};
   const licenseUrl =
-    (typeof details.ownerProfileUrl === 'string' && details.ownerProfileUrl) ||
-    (typeof author.channel_url === 'string' && author.channel_url) ||
+    (typeof channel.url === 'string' && channel.url) ||
+    (typeof details?.channel_url === 'string' && details.channel_url) ||
     null;
+  const artistName =
+    (typeof channel.name === 'string' && channel.name) ||
+    (typeof channel.username === 'string' && channel.username) ||
+    (typeof details?.author?.name === 'string' && details.author.name) ||
+    'YouTube';
 
   return {
-    stream,
+    stream: streamData.stream,
+    inputType: normalizePlayDlStreamType(streamData.type),
     info: {
-      name: details.title || 'Vidéo YouTube',
-      artist: author.name || 'YouTube',
+      name: details?.title || 'Vidéo YouTube',
+      artist: artistName,
       audioUrl: url,
       licenseUrl,
       tag: null
@@ -685,6 +675,7 @@ async function getCustomAudioStream(url) {
   const stream = await fetchAudioStream(trimmed, 'la source fournie');
   return {
     stream,
+    inputType: StreamType.Arbitrary,
     info: {
       name: 'Source fournie',
       artist: trimmed,
@@ -834,15 +825,22 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
 
     let remoteStream;
     let trackInfo = null;
+    let resourceInputType = StreamType.Arbitrary;
 
     if (customUrl) {
       const custom = await getCustomAudioStream(customUrl);
       remoteStream = custom.stream;
       trackInfo = custom.info;
+      if (custom.inputType) {
+        resourceInputType = custom.inputType;
+      }
     } else {
       const jamendoData = await getJamendoTrackStream();
       remoteStream = jamendoData.stream;
       trackInfo = jamendoData.info;
+      if (jamendoData.inputType) {
+        resourceInputType = jamendoData.inputType;
+      }
     }
 
     if (requestToken !== playbackRequestToken) {
@@ -860,7 +858,10 @@ async function loadAndPlayTrack({ customUrl = null, announceChannel = null, reas
       return null;
     }
 
-    const resource = createAudioResource(remoteStream, { inputType: StreamType.Arbitrary, inlineVolume: true });
+    const resource = createAudioResource(remoteStream, {
+      inputType: resourceInputType || StreamType.Arbitrary,
+      inlineVolume: true
+    });
     if (resource.volume) resource.volume.setVolume(currentVolume);
     if (requestToken !== playbackRequestToken) {
       try {
